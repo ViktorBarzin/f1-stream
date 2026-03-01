@@ -335,9 +335,11 @@
 						<iframe
 							src={player.embedUrl}
 							class="w-full aspect-video bg-black"
+							sandbox="allow-scripts allow-same-origin allow-forms allow-modals allow-presentation"
 							allow="autoplay; encrypted-media; fullscreen; picture-in-picture"
 							allowfullscreen
 							frameborder="0"
+							scrolling="yes"
 							title="{player.siteName} stream"
 						></iframe>
 					{:else}
