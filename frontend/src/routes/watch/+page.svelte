@@ -1,5 +1,5 @@
 <script>
-	import { fetchStreams, fetchSchedule, getProxyUrl, getEmbedProxyUrl, activateStream, deactivateStream } from '$lib/api.js';
+	import { fetchStreams, fetchSchedule, getProxyUrl, activateStream, deactivateStream } from '$lib/api.js';
 	import { onMount, onDestroy } from 'svelte';
 	import { page } from '$app/state';
 
@@ -205,7 +205,7 @@
 		if (stream.stream_type === 'embed') {
 			players = [...players, {
 				id: Date.now(), proxyUrl: '', originalUrl: stream.embed_url,
-				embedUrl: getEmbedProxyUrl(stream.embed_url), streamType: 'embed',
+				embedUrl: stream.embed_url, streamType: 'embed',
 				siteKey: stream.site_key || '', siteName: stream.site_name || 'Unknown',
 				quality: stream.quality || '', isPlaying: true, isMuted: false,
 				volume: 1, showControls: true, error: null, videoEl: null,
