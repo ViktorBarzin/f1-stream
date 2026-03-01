@@ -23,7 +23,7 @@ steps:
       provenance: false
       tags:
         - latest
-        - "v5.1.0"
+        - "v5.2.0"
       cache_from: "registry.viktorbarzin.me:5050/f1-stream:latest"
       cache_to: "type=inline"
 
