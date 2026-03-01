@@ -66,6 +66,11 @@
 			]);
 			streamsData = streamsResult;
 			scheduleData = scheduleResult;
+
+			// Auto-play the first available stream if none are active
+			if (players.length === 0 && streamsData?.streams?.length > 0) {
+				playStream(streamsData.streams[0]);
+			}
 		} catch (e) {
 			errorMsg = e.message;
 		} finally {

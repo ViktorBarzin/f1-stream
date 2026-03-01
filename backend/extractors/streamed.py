@@ -16,6 +16,22 @@ USER_AGENT = (
     "Chrome/120.0.0.0 Safari/537.36"
 )
 
+# Only include events matching these keywords (case-insensitive)
+F1_KEYWORDS = {"formula 1", "formula one", "f1", "sky sports f1"}
+# Grand Prix is shared with MotoGP — only match if "moto" is absent
+GP_KEYWORD = "grand prix"
+MOTO_KEYWORDS = {"motogp", "moto gp", "moto2", "moto3", "motoe"}
+
+
+def _is_f1_event(title: str) -> bool:
+    """Check if an event title is Formula 1 related."""
+    lower = title.lower()
+    if any(kw in lower for kw in F1_KEYWORDS):
+        return True
+    if GP_KEYWORD in lower and not any(kw in lower for kw in MOTO_KEYWORDS):
+        return True
+    return False
+
 
 class StreamedExtractor(BaseExtractor):
     """Extracts streams from Streamed.pk's public JSON API.
@@ -60,6 +76,8 @@ class StreamedExtractor(BaseExtractor):
 
                 for event in events:
                     title = event.get("title", "Unknown Event")
+                    if not _is_f1_event(title):
+                        continue
                     sources = event.get("sources", [])
                     if not sources:
                         continue
