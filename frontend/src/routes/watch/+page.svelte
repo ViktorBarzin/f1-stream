@@ -150,6 +150,7 @@
 				isMuted: false,
 				volume: 1,
 				showControls: true,
+				shieldDismissed: false,
 				error: null,
 				videoEl: null,
 				containerEl: null,
@@ -398,15 +399,32 @@
 
 					<!-- Video or Iframe -->
 					{#if player.streamType === 'embed'}
-						<iframe
-							src={player.embedUrl}
-							class="w-full aspect-video bg-black"
-							allow="autoplay; encrypted-media; fullscreen; picture-in-picture"
-							allowfullscreen
-							frameborder="0"
-							scrolling="yes"
-							title="{player.siteName} stream"
-						></iframe>
+						<div class="relative w-full aspect-video">
+							<iframe
+								src={player.embedUrl}
+								class="absolute inset-0 w-full h-full bg-black"
+								allow="autoplay; encrypted-media; fullscreen; picture-in-picture"
+								allowfullscreen
+								frameborder="0"
+								scrolling="yes"
+								title="{player.siteName} stream"
+							></iframe>
+							<!-- Click shield: absorbs ad clicks, then disappears to let user interact with player -->
+							{#if !player.shieldDismissed}
+								<div
+									class="absolute inset-0 z-20 cursor-pointer flex items-center justify-center"
+									onclick={(e) => {
+										e.preventDefault();
+										e.stopPropagation();
+										players[i] = { ...players[i], shieldDismissed: true };
+									}}
+								>
+									<div class="bg-black/70 rounded-lg px-4 py-2 text-white text-sm pointer-events-none">
+										Click to activate player
+									</div>
+								</div>
+							{/if}
+						</div>
 					{:else}
 						<video
 							bind:this={player.videoEl}
