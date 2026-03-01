@@ -61,6 +61,13 @@
 				console.warn('[f1-stream] Blocked _blank link:', link.href);
 			}
 		}, true);
+
+		// Initialize Chromecast when SDK loads
+		window['__onGCastApiAvailable'] = (isAvailable) => {
+			if (isAvailable) initCast();
+		};
+		// If SDK already loaded
+		if (window.chrome?.cast) initCast();
 	});
 
 	onDestroy(() => {
@@ -302,10 +309,52 @@
 		if (ms < 1500) return 'text-yellow-400';
 		return 'text-red-400';
 	}
+
+	// Chromecast support
+	let castAvailable = $state(false);
+
+	function initCast() {
+		if (typeof window === 'undefined' || !window.chrome?.cast) return;
+		const context = cast.framework.CastContext.getInstance();
+		context.setOptions({
+			receiverApplicationId: chrome.cast.media.DEFAULT_MEDIA_RECEIVER_APP_ID,
+			autoJoinPolicy: chrome.cast.AutoJoinPolicy.ORIGIN_SCOPED,
+		});
+		castAvailable = true;
+	}
+
+	function castStream(index) {
+		const player = players[index];
+		if (!player || !castAvailable) return;
+
+		const castSession = cast.framework.CastContext.getInstance().getCurrentSession();
+		if (!castSession) {
+			// No active session — request one
+			cast.framework.CastContext.getInstance().requestSession().then(() => {
+				castStream(index); // retry after session established
+			}).catch(() => {});
+			return;
+		}
+
+		// Build the full proxy URL for casting
+		const streamUrl = new URL(player.proxyUrl, window.location.origin).href;
+		const mediaInfo = new chrome.cast.media.MediaInfo(streamUrl, 'application/x-mpegURL');
+		mediaInfo.streamType = chrome.cast.media.StreamType.LIVE;
+		mediaInfo.metadata = new chrome.cast.media.GenericMediaMetadata();
+		mediaInfo.metadata.title = player.siteName + (player.quality ? ` (${player.quality})` : '');
+
+		const request = new chrome.cast.media.LoadRequest(mediaInfo);
+		castSession.loadMedia(request).then(() => {
+			console.log('[f1-stream] Cast started');
+		}).catch((err) => {
+			console.error('[f1-stream] Cast error:', err);
+		});
+	}
 </script>
 
 <svelte:head>
 	<title>F1 Stream - Watch{currentRace ? ` - ${currentRace.race_name}` : ''}</title>
+	<script src="https://www.gstatic.com/cv/js/sender/v1/cast_sender.js?loadCastFramework=1"></script>
 </svelte:head>
 
 <div class="max-w-7xl mx-auto px-4 py-6">
@@ -366,7 +415,8 @@
 						></video>
 					{/if}
 
-					<!-- Controls Overlay -->
+					<!-- Controls Overlay (m3u8 players only — embed players have their own controls) -->
+					{#if player.streamType !== 'embed'}
 					<div class="absolute bottom-0 left-0 right-0 bg-gradient-to-t from-black/80 to-transparent px-3 py-2 transition-opacity duration-300 {player.showControls ? 'opacity-100' : 'opacity-0'}">
 						<div class="flex items-center gap-2">
 							<button onclick={() => togglePlay(i)} class="text-white hover:text-f1-red transition-colors" aria-label={player.isPlaying ? 'Pause' : 'Play'}>
@@ -394,11 +444,18 @@
 
 							<div class="flex-1"></div>
 
+							{#if castAvailable}
+								<button onclick={() => castStream(i)} class="text-white hover:text-f1-red transition-colors" aria-label="Cast to Chromecast">
+									<svg class="w-4 h-4" fill="currentColor" viewBox="0 0 24 24"><path d="M1 18v3h3c0-1.66-1.34-3-3-3zm0-4v2c2.76 0 5 2.24 5 5h2c0-3.87-3.13-7-7-7zm0-4v2c4.97 0 9 4.03 9 9h2c0-6.08-4.93-11-11-11zm20-7H3c-1.1 0-2 .9-2 2v3h2V5h18v14h-7v2h7c1.1 0 2-.9 2-2V5c0-1.1-.9-2-2-2z"/></svg>
+								</button>
+							{/if}
+
 							<button onclick={() => toggleFullscreen(i)} class="text-white hover:text-f1-red transition-colors" aria-label="Fullscreen">
 								<svg class="w-4 h-4" fill="currentColor" viewBox="0 0 24 24"><path d="M7 14H5v5h5v-2H7v-3zm-2-4h2V7h3V5H5v5zm12 7h-3v2h5v-5h-2v3zM14 5v2h3v3h2V5h-5z"/></svg>
 							</button>
 						</div>
 					</div>
+					{/if}
 
 					<!-- Error overlay -->
 					{#if player.error}
