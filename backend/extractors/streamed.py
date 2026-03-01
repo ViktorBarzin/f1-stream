@@ -18,9 +18,11 @@ USER_AGENT = (
 
 # Only include events matching these keywords (case-insensitive)
 F1_KEYWORDS = {"formula 1", "formula one", "f1", "sky sports f1"}
-# Grand Prix is shared with MotoGP — only match if "moto" is absent
+# Grand Prix is shared with MotoGP/IndyCar — only match if no other series keywords
 GP_KEYWORD = "grand prix"
-MOTO_KEYWORDS = {"motogp", "moto gp", "moto2", "moto3", "motoe"}
+NON_F1_KEYWORDS = {"motogp", "moto gp", "moto2", "moto3", "motoe", "indycar",
+                    "indy car", "firestone", "nascar", "rally", "wrc", "wec",
+                    "lemans", "le mans", "superbike", "dtm", "supercars"}
 
 
 def _is_f1_event(title: str) -> bool:
@@ -28,7 +30,7 @@ def _is_f1_event(title: str) -> bool:
     lower = title.lower()
     if any(kw in lower for kw in F1_KEYWORDS):
         return True
-    if GP_KEYWORD in lower and not any(kw in lower for kw in MOTO_KEYWORDS):
+    if GP_KEYWORD in lower and not any(kw in lower for kw in NON_F1_KEYWORDS):
         return True
     return False
 

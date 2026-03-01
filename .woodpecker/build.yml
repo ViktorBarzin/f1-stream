@@ -23,12 +23,14 @@ steps:
       provenance: false
       tags:
         - latest
-        - "v5.2.0"
+        - "${CI_COMMIT_SHA:0:8}"
       cache_from: "registry.viktorbarzin.me:5050/f1-stream:latest"
       cache_to: "type=inline"
 
   - name: deploy
     image: bitnami/kubectl
     commands:
-      - kubectl -n f1-stream rollout restart deployment f1-stream
-      - kubectl -n f1-stream rollout status deployment f1-stream --timeout=120s
+      - export SHORT_SHA=$(echo $CI_COMMIT_SHA | cut -c1-8)
+      - echo "Deploying image tag $SHORT_SHA"
+      - kubectl -n f1-stream set image deployment/f1-stream f1-stream=viktorbarzin/f1-stream:$SHORT_SHA
+      - kubectl -n f1-stream rollout status deployment/f1-stream --timeout=120s
