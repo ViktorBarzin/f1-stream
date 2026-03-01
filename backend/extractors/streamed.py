@@ -1,4 +1,9 @@
-"""Streamed.pk extractor - fetches F1/motorsport streams via public JSON API."""
+"""Streamed.pk extractor - fetches F1 streams via public JSON API.
+
+Constructs direct m3u8 URLs from the API data using the known CDN pattern:
+  https://rr.vipstreams.in/{source}/js/{id}/{streamNo}/playlist.m3u8
+These require Referer: https://embedme.top/ which the HLS proxy handles.
+"""
 
 import logging
 
@@ -10,6 +15,8 @@ from backend.extractors.models import ExtractedStream
 logger = logging.getLogger(__name__)
 
 BASE_URL = "https://streamed.su"
+M3U8_CDN = "https://rr.vipstreams.in"
+REQUIRED_REFERER = "https://embedme.top/"
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -36,11 +43,10 @@ def _is_f1_event(title: str) -> bool:
 
 
 class StreamedExtractor(BaseExtractor):
-    """Extracts streams from Streamed.pk's public JSON API.
+    """Extracts direct m3u8 streams from Streamed.pk's public JSON API.
 
-    Uses two endpoints:
-    - GET /api/matches/motor-sports → list of events with sources
-    - GET /api/stream/{source}/{id} → embed URL for a specific source
+    Uses the API to discover F1 events and constructs direct m3u8 URLs
+    using the known CDN pattern instead of embed URLs.
     """
 
     @property
@@ -52,7 +58,7 @@ class StreamedExtractor(BaseExtractor):
         return "Streamed"
 
     async def extract(self) -> list[ExtractedStream]:
-        """Fetch motorsport events and resolve embed URLs for each source."""
+        """Fetch F1 events and construct direct m3u8 URLs."""
         streams: list[ExtractedStream] = []
 
         try:
@@ -61,7 +67,6 @@ class StreamedExtractor(BaseExtractor):
                 follow_redirects=True,
                 headers={"User-Agent": USER_AGENT, "Accept": "application/json"},
             ) as client:
-                # Get motorsport events
                 resp = await client.get(f"{BASE_URL}/api/matches/motor-sports")
                 if resp.status_code != 200:
                     logger.warning(
@@ -102,13 +107,15 @@ class StreamedExtractor(BaseExtractor):
                                 stream_data = [stream_data]
 
                             for item in stream_data:
-                                embed_url = item.get("embedUrl", "")
-                                if not embed_url:
-                                    continue
-
                                 language = item.get("language", "")
                                 hd = item.get("hd", False)
                                 stream_no = item.get("streamNo", 1)
+
+                                # Construct direct m3u8 URL
+                                m3u8_url = (
+                                    f"{M3U8_CDN}/{source_name}/js/"
+                                    f"{source_id}/{stream_no}/playlist.m3u8"
+                                )
 
                                 quality = "HD" if hd else "SD"
                                 stream_title = f"{title}"
@@ -119,13 +126,12 @@ class StreamedExtractor(BaseExtractor):
 
                                 streams.append(
                                     ExtractedStream(
-                                        url=embed_url,
+                                        url=m3u8_url,
                                         site_key=self.site_key,
                                         site_name=self.site_name,
                                         quality=quality,
                                         title=stream_title,
-                                        stream_type="embed",
-                                        embed_url=embed_url,
+                                        stream_type="m3u8",
                                     )
                                 )
                         except Exception:

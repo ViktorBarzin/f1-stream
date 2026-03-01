@@ -42,6 +42,11 @@ USER_AGENT = (
     "Chrome/120.0.0.0 Safari/537.36"
 )
 
+# Referer headers required by specific upstream domains
+DOMAIN_REFERERS = {
+    "vipstreams.in": "https://embedme.top/",
+}
+
 
 @dataclass
 class QualityVariant:
@@ -79,6 +84,21 @@ def _is_master_playlist(content: str) -> bool:
         True if this is a master playlist.
     """
     return "#EXT-X-STREAM-INF:" in content
+
+
+def _get_referer(url: str) -> str:
+    """Get the required Referer header for a given URL based on its domain.
+
+    Args:
+        url: The upstream URL to check.
+
+    Returns:
+        The Referer header value, or empty string if none required.
+    """
+    for domain, referer in DOMAIN_REFERERS.items():
+        if domain in url:
+            return referer
+    return ""
 
 
 def parse_quality_variants(content: str, base_url: str) -> list[QualityVariant]:
@@ -272,15 +292,23 @@ async def proxy_playlist(
 
     logger.info("Proxying playlist: %s", url)
 
+    # Determine if this upstream domain needs a Referer header
+    referer = _get_referer(url)
+
     # Fetch the upstream playlist
     try:
+        req_headers = {
+            "User-Agent": USER_AGENT,
+            "Accept": "*/*",
+        }
+        if referer:
+            req_headers["Referer"] = referer
+            req_headers["Origin"] = referer.rstrip("/")
+
         async with httpx.AsyncClient(
             timeout=PLAYLIST_TIMEOUT,
             follow_redirects=True,
-            headers={
-                "User-Agent": USER_AGENT,
-                "Accept": "*/*",
-            },
+            headers=req_headers,
         ) as client:
             response = await client.get(url)
 
@@ -324,13 +352,19 @@ async def proxy_playlist(
         logger.info("Fetching selected variant playlist: %s", variant_url)
 
         try:
+            variant_headers = {
+                "User-Agent": USER_AGENT,
+                "Accept": "*/*",
+            }
+            variant_referer = _get_referer(variant_url)
+            if variant_referer:
+                variant_headers["Referer"] = variant_referer
+                variant_headers["Origin"] = variant_referer.rstrip("/")
+
             async with httpx.AsyncClient(
                 timeout=PLAYLIST_TIMEOUT,
                 follow_redirects=True,
-                headers={
-                    "User-Agent": USER_AGENT,
-                    "Accept": "*/*",
-                },
+                headers=variant_headers,
             ) as client:
                 variant_response = await client.get(variant_url)
 
@@ -429,6 +463,10 @@ async def relay_stream(
         "User-Agent": USER_AGENT,
         "Accept": "*/*",
     }
+    referer = _get_referer(url)
+    if referer:
+        headers["Referer"] = referer
+        headers["Origin"] = referer.rstrip("/")
     if range_header:
         headers["Range"] = range_header
 
