@@ -1,5 +1,5 @@
 <script>
-	import { fetchStreams, fetchSchedule, getProxyUrl, activateStream, deactivateStream } from '$lib/api.js';
+	import { fetchStreams, fetchSchedule, getProxyUrl, getEmbedProxyUrl, activateStream, deactivateStream } from '$lib/api.js';
 	import { onMount, onDestroy } from 'svelte';
 	import { page } from '$app/state';
 
@@ -141,7 +141,7 @@
 				id: Date.now(),
 				proxyUrl: '',
 				originalUrl: stream.embed_url,
-				embedUrl: stream.embed_url,
+				embedUrl: getEmbedProxyUrl(stream.embed_url),
 				streamType: 'embed',
 				siteKey: stream.site_key || '',
 				siteName: stream.site_name || stream.site_key || 'Unknown',
@@ -150,7 +150,6 @@
 				isMuted: false,
 				volume: 1,
 				showControls: true,
-				shieldClicks: 0,
 				error: null,
 				videoEl: null,
 				containerEl: null,
@@ -399,33 +398,15 @@
 
 					<!-- Video or Iframe -->
 					{#if player.streamType === 'embed'}
-						<div class="relative w-full aspect-video">
-							<iframe
-								src={player.embedUrl}
-								class="absolute inset-0 w-full h-full bg-black"
-								allow="autoplay; encrypted-media; fullscreen; picture-in-picture"
-								allowfullscreen
-								frameborder="0"
-								scrolling="yes"
-								title="{player.siteName} stream"
-							></iframe>
-							<!-- Click shield: absorbs ad clicks then passes click through to iframe -->
-							{#if player.shieldClicks < 2}
-								<div
-									class="absolute inset-0 z-20 cursor-pointer flex items-center justify-center"
-									onclick={(e) => {
-										e.preventDefault();
-										e.stopPropagation();
-										const clicks = (players[i].shieldClicks || 0) + 1;
-										players[i] = { ...players[i], shieldClicks: clicks };
-									}}
-								>
-									<div class="bg-black/70 rounded-lg px-4 py-2 text-white text-sm pointer-events-none">
-										{player.shieldClicks === 0 ? 'Click to activate player' : 'Click again to start'}
-									</div>
-								</div>
-							{/if}
-						</div>
+						<iframe
+							src={player.embedUrl}
+							class="w-full aspect-video bg-black"
+							allow="autoplay; encrypted-media; fullscreen; picture-in-picture"
+							allowfullscreen
+							frameborder="0"
+							scrolling="yes"
+							title="{player.siteName} stream"
+						></iframe>
 					{:else}
 						<video
 							bind:this={player.videoEl}

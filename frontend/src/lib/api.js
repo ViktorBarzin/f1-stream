@@ -45,6 +45,16 @@ export function getProxyUrl(m3u8Url) {
 }
 
 /**
+ * Get the proxied embed URL (strips ad scripts from the embed page).
+ * @param {string} embedUrl - The original embed URL
+ * @returns {string} The embed proxy URL
+ */
+export function getEmbedProxyUrl(embedUrl) {
+	const encoded = toBase64Url(embedUrl);
+	return `${API_BASE}/embed-proxy?url=${encoded}`;
+}
+
+/**
  * Mark a stream as actively being watched (enables token refresh).
  * @param {string} url - The stream URL
  * @param {string} [siteKey] - Optional site key

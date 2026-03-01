@@ -10,6 +10,7 @@ from apscheduler.triggers.interval import IntervalTrigger
 from fastapi import FastAPI, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 from starlette.responses import Response, StreamingResponse
 
@@ -412,6 +413,63 @@ async def relay_endpoint(
 # --- Frontend Static Files ---
 # Mount the SvelteKit static build AFTER all API routes so API endpoints take priority.
 # SvelteKit adapter-static with ssr=false produces {page}.html files and a fallback index.html.
+import re as _re
+
+# Ad script patterns to strip from embed pages
+_AD_PATTERNS = [
+    _re.compile(r'<script[^>]*>.*?aclib\.runPop.*?</script>', _re.DOTALL | _re.IGNORECASE),
+    _re.compile(r'<script[^>]*src=["\'][^"\']*adsco\.re[^"\']*["\'][^>]*></script>', _re.IGNORECASE),
+    _re.compile(r'<script[^>]*>.*?runPop.*?</script>', _re.DOTALL | _re.IGNORECASE),
+    _re.compile(r'<script[^>]*>.*?popunder.*?</script>', _re.DOTALL | _re.IGNORECASE),
+    # Remove the hidden ad iframe loader
+    _re.compile(r"\(.*?insertAdjacentHTML.*?ad\.html.*?\)\(\);", _re.DOTALL),
+]
+
+
+@app.get("/embed-proxy")
+async def embed_proxy(
+    url: str = Query(..., description="Base64url-encoded embed URL"),
+):
+    """Proxy an embed page, stripping ad/popup scripts.
+
+    Fetches the embed page, removes ad scripts (aclib.runPop, popunder,
+    adsco.re), and serves the cleaned HTML. This allows iframe embedding
+    without popups or redirects.
+    """
+    import httpx
+    from backend.m3u8_rewriter import decode_url
+
+    try:
+        decoded_url = decode_url(url)
+    except Exception as e:
+        return Response(content=f"Invalid URL: {e}", status_code=400)
+
+    try:
+        async with httpx.AsyncClient(
+            timeout=15.0,
+            follow_redirects=True,
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                "Referer": "https://streamed.pk/",
+            },
+        ) as client:
+            resp = await client.get(decoded_url)
+            if resp.status_code != 200:
+                return Response(content=f"Upstream returned {resp.status_code}", status_code=502)
+
+            html = resp.text
+
+            # Strip ad scripts
+            for pattern in _AD_PATTERNS:
+                html = pattern.sub('', html)
+
+            return HTMLResponse(content=html)
+
+    except Exception as e:
+        logger.exception("Embed proxy error for %s", decoded_url)
+        return Response(content=f"Proxy error: {e}", status_code=502)
+
+
 # Starlette StaticFiles(html=True) only checks {path}/index.html, not {path}.html.
 # We use a catch-all route to handle both patterns and the SPA fallback.
 _frontend_dir = os.path.realpath(os.path.join(os.path.dirname(__file__), "..", "frontend", "build"))
