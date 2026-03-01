@@ -1,13 +1,6 @@
 when:
-  event: push
-  branch: main
-
-clone:
-  git:
-    image: woodpeckerci/plugin-git
-    settings:
-      attempts: 5
-      backoff: 10s
+  - event: push
+    branch: main
 
 steps:
   - name: build-image
