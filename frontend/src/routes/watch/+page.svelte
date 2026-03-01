@@ -352,7 +352,6 @@
 						<iframe
 							src={player.embedUrl}
 							class="w-full aspect-video bg-black"
-							sandbox="allow-scripts allow-same-origin allow-forms allow-presentation"
 							allow="autoplay; encrypted-media; fullscreen; picture-in-picture"
 							allowfullscreen
 							frameborder="0"
