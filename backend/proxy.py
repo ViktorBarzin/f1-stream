@@ -45,6 +45,7 @@ USER_AGENT = (
 # Referer headers required by specific upstream domains
 DOMAIN_REFERERS = {
     "vipstreams.in": "https://embedme.top/",
+    "serveplay.site": "https://pushembdz.store/",
 }
 
 

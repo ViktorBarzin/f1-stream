@@ -17,9 +17,12 @@ from backend.extractors.demo import DemoExtractor
 from backend.extractors.discord_source import DiscordExtractor
 from backend.extractors.fallback import FallbackExtractor
 from backend.extractors.models import ExtractedStream
+from backend.extractors.pitsport import PitsportExtractor
+from backend.extractors.ppv import PPVExtractor
 from backend.extractors.registry import ExtractorRegistry
 from backend.extractors.service import ExtractionService
 from backend.extractors.streamed import StreamedExtractor
+from backend.extractors.timstreams import TimStreamsExtractor
 
 __all__ = [
     "ExtractedStream",
@@ -42,6 +45,9 @@ def create_registry() -> ExtractorRegistry:
     registry.register(StreamedExtractor())
     registry.register(DaddyLiveExtractor())
     registry.register(AceztrimsExtractor())
+    registry.register(PitsportExtractor())
+    registry.register(PPVExtractor())
+    registry.register(TimStreamsExtractor())
     registry.register(DiscordExtractor())
     registry.register(FallbackExtractor())
 
