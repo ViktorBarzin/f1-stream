@@ -44,6 +44,23 @@
 		Hls = hlsModule.default;
 		loadData();
 		document.addEventListener('fullscreenchange', onFullscreenChange);
+
+		// Block popups, new windows, and new tabs from embedded content
+		const origOpen = window.open;
+		window.open = function (...args) {
+			console.warn('[f1-stream] Blocked window.open:', args[0]);
+			return null;
+		};
+
+		// Block clicks that try to open new tabs (target="_blank")
+		document.addEventListener('click', (e) => {
+			const link = e.target?.closest?.('a[target="_blank"]');
+			if (link) {
+				e.preventDefault();
+				e.stopPropagation();
+				console.warn('[f1-stream] Blocked _blank link:', link.href);
+			}
+		}, true);
 	});
 
 	onDestroy(() => {
@@ -335,7 +352,7 @@
 						<iframe
 							src={player.embedUrl}
 							class="w-full aspect-video bg-black"
-							sandbox="allow-scripts allow-same-origin allow-forms allow-modals allow-presentation"
+							sandbox="allow-scripts allow-same-origin allow-forms allow-presentation"
 							allow="autoplay; encrypted-media; fullscreen; picture-in-picture"
 							allowfullscreen
 							frameborder="0"
