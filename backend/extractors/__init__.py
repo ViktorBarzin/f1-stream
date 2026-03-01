@@ -14,6 +14,7 @@ Example:
 from backend.extractors.aceztrims import AceztrimsExtractor
 from backend.extractors.daddylive import DaddyLiveExtractor
 from backend.extractors.demo import DemoExtractor
+from backend.extractors.discord_source import DiscordExtractor
 from backend.extractors.fallback import FallbackExtractor
 from backend.extractors.models import ExtractedStream
 from backend.extractors.registry import ExtractorRegistry
@@ -41,6 +42,7 @@ def create_registry() -> ExtractorRegistry:
     registry.register(StreamedExtractor())
     registry.register(DaddyLiveExtractor())
     registry.register(AceztrimsExtractor())
+    registry.register(DiscordExtractor())
     registry.register(FallbackExtractor())
 
     return registry

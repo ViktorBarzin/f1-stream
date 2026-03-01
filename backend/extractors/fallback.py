@@ -16,8 +16,28 @@ logger = logging.getLogger(__name__)
 # These are aggregator sites that list F1 streams
 FALLBACK_SOURCES = [
     {
-        "url": "https://wearechecking.live/streams-pages/motorsports",
-        "title": "WeAreChecking - Motorsports",
+        "url": "https://pitsport.xyz/",
+        "title": "Pitsport - All Motorsports",
+        "quality": "",
+    },
+    {
+        "url": "https://rerace.io/",
+        "title": "Rerace - F1",
+        "quality": "",
+    },
+    {
+        "url": "https://timstreams.online/",
+        "title": "TimStreams - F1/WEC/Motorsports",
+        "quality": "",
+    },
+    {
+        "url": "https://ppv.to/",
+        "title": "PPV.TO - F1/Sports",
+        "quality": "",
+    },
+    {
+        "url": "https://aceztrims.pages.dev/f1/",
+        "title": "Aceztrims - F1",
         "quality": "",
     },
     {
@@ -38,11 +58,6 @@ FALLBACK_SOURCES = [
     {
         "url": "https://1stream.vip/formula-1-streams/",
         "title": "1Stream - Formula 1",
-        "quality": "",
-    },
-    {
-        "url": "https://aceztrims.pages.dev/f1/",
-        "title": "Aceztrims - F1",
         "quality": "",
     },
     {
