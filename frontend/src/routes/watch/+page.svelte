@@ -150,7 +150,7 @@
 				isMuted: false,
 				volume: 1,
 				showControls: true,
-				shieldDismissed: false,
+				shieldClicks: 0,
 				error: null,
 				videoEl: null,
 				containerEl: null,
@@ -409,18 +409,19 @@
 								scrolling="yes"
 								title="{player.siteName} stream"
 							></iframe>
-							<!-- Click shield: absorbs ad clicks, then disappears to let user interact with player -->
-							{#if !player.shieldDismissed}
+							<!-- Click shield: absorbs ad clicks then passes click through to iframe -->
+							{#if player.shieldClicks < 2}
 								<div
 									class="absolute inset-0 z-20 cursor-pointer flex items-center justify-center"
 									onclick={(e) => {
 										e.preventDefault();
 										e.stopPropagation();
-										players[i] = { ...players[i], shieldDismissed: true };
+										const clicks = (players[i].shieldClicks || 0) + 1;
+										players[i] = { ...players[i], shieldClicks: clicks };
 									}}
 								>
 									<div class="bg-black/70 rounded-lg px-4 py-2 text-white text-sm pointer-events-none">
-										Click to activate player
+										{player.shieldClicks === 0 ? 'Click to activate player' : 'Click again to start'}
 									</div>
 								</div>
 							{/if}
