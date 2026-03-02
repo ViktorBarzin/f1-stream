@@ -152,15 +152,6 @@
 		loadData();
 		document.addEventListener('fullscreenchange', onFullscreenChange);
 
-		window.open = function (...args) {
-			console.warn('[f1-stream] Blocked window.open:', args[0]);
-			return null;
-		};
-		document.addEventListener('click', (e) => {
-			const link = e.target?.closest?.('a[target="_blank"]');
-			if (link) { e.preventDefault(); e.stopPropagation(); }
-		}, true);
-
 		window['__onGCastApiAvailable'] = (isAvailable) => { if (isAvailable) initCast(); };
 		if (window.chrome?.cast) initCast();
 	});
