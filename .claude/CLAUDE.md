@@ -23,12 +23,15 @@
 
 ## Replays
 - **Source**: r/MotorsportsReplays (Reddit public JSON API, no auth)
-- **Filtering**: Flair-based ("Formula 1") + keyword fallback (F1, Grand Prix, etc.), word-boundary regex for non-F1 rejection
-- **Grouping**: Posts grouped by race event, cross-referenced with schedule for official names
-- **Link types**: video (Streamable, direct .mp4 → inline player + download), embed (rerace.io, etc. → new tab), external (→ new tab)
-- **Scheduling**: APScheduler every 30 min + manual refresh via POST /replays/refresh
-- **Frontend**: /replays route with collapsible event groups, session sub-groups
-- **Video proxy**: /replays/video and /replays/download endpoints with streaming + Range support
+- **Filtering**: Flair-based ("Formula 1") + keyword fallback (F1, Grand Prix, etc.), word-boundary regex for non-F1 rejection (includes Indy NXT, MotoGP, NASCAR, etc.)
+- **Event extraction**: GP_NAME_PATTERN regex + location fallback mapping (~25 F1 locations → canonical GP names)
+- **Session detection**: Multi-language (English + Spanish), multi-session detection → "Full Event" for compilations
+- **Grouping**: Posts grouped by race event, normalized against schedule using race_name/country/locality
+- **Link types**: video (Streamable, Pixeldrain, direct .mp4 → inline player + download), embed (rerace.io, etc. → new tab), external (→ new tab)
+- **API prefix**: Replay endpoints at /api/replays, /api/replays/refresh, /api/replays/video, /api/replays/download (avoids route conflict with SvelteKit /replays page)
+- **Scheduling**: APScheduler every 30 min + manual refresh via POST /api/replays/refresh
+- **Frontend**: /replays route with collapsible event groups, session sub-groups, SESSION_ORDER includes "Full Event"
+- **Video proxy**: /api/replays/video and /api/replays/download endpoints with streaming + Range support
 
 ## Key Learnings
 - **Embed iframe sandbox doesn't work**: embedsports.top explicitly checks for sandbox attribute and refuses to load player. Must use iframes without sandbox.
