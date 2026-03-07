@@ -4,6 +4,7 @@ import logging
 import os
 from contextlib import asynccontextmanager
 
+import httpx
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
@@ -16,6 +17,7 @@ from starlette.responses import Response, StreamingResponse
 
 from backend.extractors import create_extraction_service
 from backend.proxy import proxy_playlist, relay_stream
+from backend.replays import ReplayService
 from backend.schedule import ScheduleService
 from backend.token_refresh import TokenRefreshManager
 
@@ -28,6 +30,7 @@ logger = logging.getLogger(__name__)
 schedule_service = ScheduleService()
 extraction_service = create_extraction_service()
 token_refresh_manager = TokenRefreshManager(extraction_service)
+replay_service = ReplayService()
 scheduler = AsyncIOScheduler()
 
 
@@ -112,6 +115,12 @@ async def _scheduled_token_refresh() -> None:
         logger.exception("Token refresh failed (non-fatal)")
 
 
+async def _scheduled_replay_scrape() -> None:
+    """Callback for APScheduler replay scraping."""
+    logger.info("Running scheduled replay scrape...")
+    await replay_service.scrape()
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Startup and shutdown lifecycle handler."""
@@ -150,9 +159,22 @@ async def lifespan(app: FastAPI):
         replace_existing=True,
     )
 
+    # Run initial replay scrape
+    logger.info("Running initial replay scrape...")
+    await replay_service.scrape()
+
+    # Schedule periodic replay scraping (every 30 minutes)
+    scheduler.add_job(
+        _scheduled_replay_scrape,
+        trigger=IntervalTrigger(minutes=30),
+        id="replay_scrape",
+        name="Scrape r/MotorsportsReplays for F1 replays",
+        replace_existing=True,
+    )
+
     scheduler.start()
     logger.info(
-        "APScheduler started - schedule refresh at 03:00 UTC, extraction every 30m, token refresh every 4m"
+        "APScheduler started - schedule refresh at 03:00 UTC, extraction every 30m, token refresh every 4m, replay scrape every 30m"
     )
 
     yield
@@ -321,6 +343,138 @@ async def trigger_extraction():
         "live_streams": status["total_live_streams"],
         "extractors_run": len(status["extractors"]),
     }
+
+
+# --- Replays ---
+
+
+@app.get("/replays")
+async def get_replays():
+    """Return F1 replay posts grouped by race event."""
+    schedule_data = schedule_service.get_schedule()
+    races = schedule_data.get("races", [])
+    return replay_service.get_replays_grouped(schedule_races=races)
+
+
+@app.post("/replays/refresh")
+async def refresh_replays():
+    """Manually trigger a replay scrape from Reddit."""
+    await replay_service.scrape()
+    schedule_data = schedule_service.get_schedule()
+    races = schedule_data.get("races", [])
+    return replay_service.get_replays_grouped(schedule_races=races)
+
+
+@app.get("/replays/video")
+async def replay_video(
+    request: Request,
+    url: str = Query(..., description="Base64url-encoded video URL"),
+):
+    """Proxy a video file for inline playback.
+
+    Streams the video with appropriate Content-Type headers for
+    HTML5 <video> tag playback. Supports Range requests for seeking.
+    """
+    from backend.m3u8_rewriter import decode_url
+
+    try:
+        decoded_url = decode_url(url)
+    except Exception as e:
+        return Response(content=f"Invalid URL: {e}", status_code=400)
+
+    range_header = request.headers.get("range")
+    headers_to_send = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+    }
+    if range_header:
+        headers_to_send["Range"] = range_header
+
+    try:
+        client = httpx.AsyncClient(timeout=60.0, follow_redirects=True)
+        resp = await client.send(
+            client.build_request("GET", decoded_url, headers=headers_to_send),
+            stream=True,
+        )
+
+        response_headers = {
+            "Content-Type": resp.headers.get("Content-Type", "video/mp4"),
+            "Accept-Ranges": "bytes",
+        }
+        if "Content-Length" in resp.headers:
+            response_headers["Content-Length"] = resp.headers["Content-Length"]
+        if "Content-Range" in resp.headers:
+            response_headers["Content-Range"] = resp.headers["Content-Range"]
+
+        async def stream_video():
+            try:
+                async for chunk in resp.aiter_bytes(chunk_size=65536):
+                    yield chunk
+            finally:
+                await resp.aclose()
+                await client.aclose()
+
+        return StreamingResponse(
+            stream_video(),
+            status_code=resp.status_code,
+            headers=response_headers,
+        )
+
+    except Exception as e:
+        logger.exception("Replay video proxy error for %s", decoded_url)
+        return Response(content=f"Proxy error: {e}", status_code=502)
+
+
+@app.get("/replays/download")
+async def replay_download(
+    url: str = Query(..., description="Base64url-encoded video URL"),
+):
+    """Proxy a video file with Content-Disposition header to trigger download."""
+    from backend.m3u8_rewriter import decode_url
+    from urllib.parse import urlparse
+    import os
+
+    try:
+        decoded_url = decode_url(url)
+    except Exception as e:
+        return Response(content=f"Invalid URL: {e}", status_code=400)
+
+    # Derive filename from URL
+    parsed = urlparse(decoded_url)
+    filename = os.path.basename(parsed.path) or "replay.mp4"
+
+    try:
+        client = httpx.AsyncClient(timeout=60.0, follow_redirects=True)
+        resp = await client.send(
+            client.build_request("GET", decoded_url, headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            }),
+            stream=True,
+        )
+
+        response_headers = {
+            "Content-Type": resp.headers.get("Content-Type", "application/octet-stream"),
+            "Content-Disposition": f'attachment; filename="{filename}"',
+        }
+        if "Content-Length" in resp.headers:
+            response_headers["Content-Length"] = resp.headers["Content-Length"]
+
+        async def stream_download():
+            try:
+                async for chunk in resp.aiter_bytes(chunk_size=65536):
+                    yield chunk
+            finally:
+                await resp.aclose()
+                await client.aclose()
+
+        return StreamingResponse(
+            stream_download(),
+            status_code=200,
+            headers=response_headers,
+        )
+
+    except Exception as e:
+        logger.exception("Replay download error for %s", decoded_url)
+        return Response(content=f"Download error: {e}", status_code=502)
 
 
 # --- HLS Proxy ---
