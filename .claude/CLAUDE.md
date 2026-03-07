@@ -21,6 +21,15 @@
 | discord | Discord user token → channel messages | embed | Monitors 4 channels in WAC server (guild 1249169549509525545) |
 | fallback | Static list from freemotorsports.com | embed | 10 aggregator sites (pitsport, rerace, timstreams, ppv, aceztrims, etc.) |
 
+## Replays
+- **Source**: r/MotorsportsReplays (Reddit public JSON API, no auth)
+- **Filtering**: Flair-based ("Formula 1") + keyword fallback (F1, Grand Prix, etc.), word-boundary regex for non-F1 rejection
+- **Grouping**: Posts grouped by race event, cross-referenced with schedule for official names
+- **Link types**: video (Streamable, direct .mp4 → inline player + download), embed (rerace.io, etc. → new tab), external (→ new tab)
+- **Scheduling**: APScheduler every 30 min + manual refresh via POST /replays/refresh
+- **Frontend**: /replays route with collapsible event groups, session sub-groups
+- **Video proxy**: /replays/video and /replays/download endpoints with streaming + Range support
+
 ## Key Learnings
 - **Embed iframe sandbox doesn't work**: embedsports.top explicitly checks for sandbox attribute and refuses to load player. Must use iframes without sandbox.
 - **Embed proxy doesn't work**: Proxying embed pages through backend breaks `window.location.pathname` references and relative URLs in the embedded JS. Load embeds directly.
