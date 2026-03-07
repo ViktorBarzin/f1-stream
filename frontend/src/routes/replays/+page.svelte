@@ -98,7 +98,7 @@
 	}
 
 	// Session type ordering
-	const SESSION_ORDER = { 'Race': 0, 'Sprint': 1, 'Sprint Qualifying': 2, 'Qualifying': 3, 'Practice': 4, 'Pre-Race': 5, 'Other': 6 };
+	const SESSION_ORDER = { 'Race': 0, 'Sprint': 1, 'Sprint Qualifying': 2, 'Qualifying': 3, 'Practice': 4, 'Pre-Race': 5, 'Full Event': 6, 'Other': 7 };
 	function sessionOrder(type) {
 		return SESSION_ORDER[type] ?? 99;
 	}

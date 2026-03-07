@@ -20,7 +20,7 @@ F1_FLAIRS = {"formula 1", "f1"}
 # Keyword-based filtering (fallback for unflaired posts)
 F1_KEYWORDS = {"formula 1", "formula one", "f1", "grand prix"}
 _NON_F1_RE = re.compile(
-    r"\b(?:motogp|moto\s?gp|moto2|moto3|motoe|indycar|indy\s?car|nascar|"
+    r"\b(?:motogp|moto\s?gp|moto2|moto3|motoe|indycar|indy\s?car|indy\s?nxt|nascar|"
     r"rally|wrc|wec|lemans|le\s+mans|superbike|dtm|supercars|"
     r"formula\s+e|formula\s+2|formula\s+3|f2|f3|fe)\b",
     re.IGNORECASE,
@@ -30,21 +30,61 @@ _NON_F1_RE = re.compile(
 SESSION_PATTERNS = [
     (re.compile(r"\b(?:sprint qualifying|sprint shootout|sq)\b", re.IGNORECASE), "Sprint Qualifying"),
     (re.compile(r"\b(?:sprint race|sprint)\b", re.IGNORECASE), "Sprint"),
-    (re.compile(r"\b(?:race)\b", re.IGNORECASE), "Race"),
-    (re.compile(r"\b(?:qualifying|quali|q1|q2|q3)\b", re.IGNORECASE), "Qualifying"),
+    (re.compile(r"\b(?:race|carrera)\b", re.IGNORECASE), "Race"),
+    (re.compile(r"\b(?:qualifying|quali|qualy|q1|q2|q3|clasificaci[oó]n)\b", re.IGNORECASE), "Qualifying"),
     (re.compile(r"\b(?:free practice|practice|fp1|fp2|fp3)\b", re.IGNORECASE), "Practice"),
     (re.compile(r"\b(?:pre-race|pre race|build.?up)\b", re.IGNORECASE), "Pre-Race"),
+    (re.compile(r"\b(?:full\s+weekend|complete\s+weekend|full\s+event|full\s+race\s+weekend)\b", re.IGNORECASE), "Full Event"),
 ]
 
-# Known GP names for event extraction
+# Known GP names for event extraction (requires at least one word before GP/Grand Prix)
 GP_NAME_PATTERN = re.compile(
     r"(?:(?:20\d{2})\s+)?(?:F1\s+)?"
-    r"([\w\s]+?(?:Grand Prix|GP))",
+    r"([\w]+(?:\s+[\w]+)*?\s+(?:Grand Prix|GP))",
     re.IGNORECASE,
 )
 
+# Fallback: known F1 race locations for when GP_NAME_PATTERN fails
+_LOCATION_PATTERN = re.compile(
+    r"\b(Austral(?:ia|ian)|Bahrain|Saudi|Jeddah|Japan(?:ese)?|Chinese|China|Shanghai|Suzuka|"
+    r"Miami|Imola|Monaco|Spain|Spanish|Barcelona|Canad(?:a|ian)|Montreal|Austria[n]?|Spielberg|"
+    r"British|Silverstone|Hungar(?:y|ian)|Budapest|Belgian?|Spa|Dutch|Netherlands|Zandvoort|"
+    r"Italy|Italian|Monza|Singapore(?:an)?|Azerbaijan|Baku|United States|Austin|COTA|"
+    r"Mexic(?:o|an)|Brazil(?:ian)?|Interlagos|Las Vegas|Qatar|Abu Dhabi|Yas Marina|"
+    r"Emilia Romagna|S[aã]o Paulo)\b",
+    re.IGNORECASE,
+)
+
+_LOCATION_TO_GP: dict[str, str] = {
+    "australia": "Australian Grand Prix", "australian": "Australian Grand Prix",
+    "bahrain": "Bahrain Grand Prix",
+    "saudi": "Saudi Arabian Grand Prix", "jeddah": "Saudi Arabian Grand Prix",
+    "japan": "Japanese Grand Prix", "japanese": "Japanese Grand Prix", "suzuka": "Japanese Grand Prix",
+    "chinese": "Chinese Grand Prix", "china": "Chinese Grand Prix", "shanghai": "Chinese Grand Prix",
+    "miami": "Miami Grand Prix",
+    "imola": "Emilia Romagna Grand Prix", "emilia romagna": "Emilia Romagna Grand Prix",
+    "monaco": "Monaco Grand Prix",
+    "spain": "Spanish Grand Prix", "spanish": "Spanish Grand Prix", "barcelona": "Spanish Grand Prix",
+    "canada": "Canadian Grand Prix", "canadian": "Canadian Grand Prix", "montreal": "Canadian Grand Prix",
+    "austria": "Austrian Grand Prix", "austrian": "Austrian Grand Prix", "spielberg": "Austrian Grand Prix",
+    "british": "British Grand Prix", "silverstone": "British Grand Prix",
+    "hungary": "Hungarian Grand Prix", "hungarian": "Hungarian Grand Prix", "budapest": "Hungarian Grand Prix",
+    "belgium": "Belgian Grand Prix", "belgian": "Belgian Grand Prix", "spa": "Belgian Grand Prix",
+    "dutch": "Dutch Grand Prix", "netherlands": "Dutch Grand Prix", "zandvoort": "Dutch Grand Prix",
+    "italy": "Italian Grand Prix", "italian": "Italian Grand Prix", "monza": "Italian Grand Prix",
+    "singapore": "Singapore Grand Prix", "singaporean": "Singapore Grand Prix",
+    "azerbaijan": "Azerbaijan Grand Prix", "baku": "Azerbaijan Grand Prix",
+    "united states": "United States Grand Prix", "austin": "United States Grand Prix", "cota": "United States Grand Prix",
+    "mexico": "Mexican Grand Prix", "mexican": "Mexican Grand Prix",
+    "brazil": "São Paulo Grand Prix", "brazilian": "São Paulo Grand Prix",
+    "interlagos": "São Paulo Grand Prix", "são paulo": "São Paulo Grand Prix", "sao paulo": "São Paulo Grand Prix",
+    "las vegas": "Las Vegas Grand Prix",
+    "qatar": "Qatar Grand Prix",
+    "abu dhabi": "Abu Dhabi Grand Prix", "yas marina": "Abu Dhabi Grand Prix",
+}
+
 # Link type detection
-VIDEO_DOMAINS = {"streamable.com", "streamja.com", "streamff.com", "streamgg.com"}
+VIDEO_DOMAINS = {"streamable.com", "streamja.com", "streamff.com", "streamgg.com", "pixeldrain.com"}
 VIDEO_EXTENSIONS = {".mp4", ".mkv", ".webm", ".avi"}
 EMBED_DOMAINS = {"rerace.io", "f1full.com", "f1fullraces.com"}
 
@@ -104,12 +144,15 @@ def _is_f1_post(title: str, flair: str | None) -> bool:
     return False
 
 
-def _extract_session_type(title: str) -> str | None:
+def _extract_session_type(title: str) -> str:
     """Extract the session type from a post title."""
-    for pattern, session_type in SESSION_PATTERNS:
-        if pattern.search(title):
-            return session_type
-    return None
+    matches = [st for pattern, st in SESSION_PATTERNS if pattern.search(title)]
+    # Multiple distinct session types → full event compilation
+    if len(set(matches)) > 1:
+        return "Full Event"
+    if matches:
+        return matches[0]
+    return "Full Event"
 
 
 def _extract_event_name(title: str) -> str | None:
@@ -121,6 +164,14 @@ def _extract_event_name(title: str) -> str | None:
         if name.lower().endswith(" gp"):
             name = name[:-3] + " Grand Prix"
         return name
+
+    # Fallback: look for known location keywords in the title
+    loc_match = _LOCATION_PATTERN.search(title)
+    if loc_match:
+        key = loc_match.group(1).lower()
+        if key in _LOCATION_TO_GP:
+            return _LOCATION_TO_GP[key]
+
     return None
 
 
@@ -160,6 +211,7 @@ def _make_label(url: str) -> str:
         "rerace.io": "ReRace",
         "f1full.com": "F1Full",
         "f1fullraces.com": "F1FullRaces",
+        "pixeldrain.com": "Pixeldrain",
         "mega.nz": "Mega",
         "drive.google.com": "Google Drive",
     }
@@ -235,6 +287,27 @@ async def _resolve_streamable_url(url: str, client: httpx.AsyncClient) -> str | 
         return None
 
 
+async def _resolve_pixeldrain_url(url: str, client: httpx.AsyncClient) -> str | None:
+    """Extract the direct download URL from a Pixeldrain link."""
+    try:
+        from urllib.parse import urlparse
+        parsed = urlparse(url)
+        path_parts = parsed.path.strip("/").split("/")
+
+        if len(path_parts) == 2 and path_parts[0] == "u":
+            file_id = path_parts[1]
+            resp = await client.head(
+                f"https://pixeldrain.com/api/file/{file_id}",
+                follow_redirects=True,
+            )
+            if resp.status_code == 200:
+                return f"https://pixeldrain.com/api/file/{file_id}"
+        return None
+    except Exception:
+        logger.debug("Failed to resolve Pixeldrain URL: %s", url, exc_info=True)
+        return None
+
+
 class ReplayService:
     """Scrapes r/MotorsportsReplays, caches results, and serves grouped replays."""
 
@@ -294,7 +367,7 @@ class ReplayService:
                         if not links:
                             continue
 
-                        # Collect streamable links for concurrent resolution
+                        # Resolve video URLs concurrently (Streamable + Pixeldrain)
                         streamable_links = [
                             link for link in links
                             if link.link_type == "video" and "streamable.com" in link.url
@@ -304,6 +377,18 @@ class ReplayService:
                                 *(_resolve_streamable_url(link.url, client) for link in streamable_links)
                             )
                             for link, video_url in zip(streamable_links, results):
+                                if video_url:
+                                    link.video_url = video_url
+
+                        pixeldrain_links = [
+                            link for link in links
+                            if link.link_type == "video" and "pixeldrain.com" in link.url
+                        ]
+                        if pixeldrain_links:
+                            results = await asyncio.gather(
+                                *(_resolve_pixeldrain_url(link.url, client) for link in pixeldrain_links)
+                            )
+                            for link, video_url in zip(pixeldrain_links, results):
                                 if video_url:
                                     link.video_url = video_url
 
@@ -335,32 +420,38 @@ class ReplayService:
         logger.info("[replays] Scraped %d F1 replay post(s)", len(posts))
 
     def get_replays_grouped(self, schedule_races: list[dict] | None = None) -> dict:
-        """Return replay posts grouped by event, with sessions as sub-groups.
+        """Return replay posts grouped by event, with sessions as sub-groups."""
 
-        Args:
-            schedule_races: Optional list of races from schedule service for
-                           cross-referencing official event names.
-        """
-        # Build event groups
-        events: dict[str, dict] = {}  # event_name -> {event_name, event_date, sessions: {type: [posts]}}
+        def _normalize_event_name(name: str) -> tuple[str, str | None]:
+            """Match event name against schedule for canonical name + date."""
+            if not schedule_races or not name or name == "Other":
+                return name, None
+
+            name_lower = name.lower()
+            name_core = name_lower.replace("grand prix", "").replace(" gp", "").strip()
+
+            for race in schedule_races:
+                race_name = race.get("race_name", "")
+                race_core = race_name.lower().replace("grand prix", "").strip()
+                race_country = race.get("country", "").lower()
+                race_locality = race.get("locality", "").lower()
+
+                if name_core and race_core and (
+                    name_core in race_core
+                    or race_core in name_core
+                    or name_core in race_country
+                    or race_country in name_core
+                    or (race_locality and name_core in race_locality)
+                ):
+                    return race_name, race.get("date")
+
+            return name, None
+
+        events: dict[str, dict] = {}
 
         for post in self._posts:
-            event_name = post.event_name or "Other"
-
-            # Try to match with official schedule for better names and dates
-            event_date = None
-            if schedule_races and event_name != "Other":
-                for race in schedule_races:
-                    race_name = race.get("race_name", "")
-                    if (
-                        event_name.lower().replace("grand prix", "").strip()
-                        in race_name.lower()
-                        or race_name.lower().replace("grand prix", "").strip()
-                        in event_name.lower()
-                    ):
-                        event_name = race_name
-                        event_date = race.get("date")
-                        break
+            raw_name = post.event_name or "Other"
+            event_name, event_date = _normalize_event_name(raw_name)
 
             if event_name not in events:
                 events[event_name] = {
@@ -371,13 +462,12 @@ class ReplayService:
             elif event_date and events[event_name]["event_date"] is None:
                 events[event_name]["event_date"] = event_date
 
-            session_type = post.session_type or "Other"
+            session_type = post.session_type or "Full Event"
             if session_type not in events[event_name]["sessions"]:
                 events[event_name]["sessions"][session_type] = []
 
             events[event_name]["sessions"][session_type].append(post.to_dict())
 
-        # Sort events by most recent post
         sorted_events = sorted(
             events.values(),
             key=lambda e: max(

@@ -348,7 +348,7 @@ async def trigger_extraction():
 # --- Replays ---
 
 
-@app.get("/replays")
+@app.get("/api/replays")
 async def get_replays():
     """Return F1 replay posts grouped by race event."""
     schedule_data = schedule_service.get_schedule()
@@ -356,7 +356,7 @@ async def get_replays():
     return replay_service.get_replays_grouped(schedule_races=races)
 
 
-@app.post("/replays/refresh")
+@app.post("/api/replays/refresh")
 async def refresh_replays():
     """Manually trigger a replay scrape from Reddit."""
     await replay_service.scrape()
@@ -365,7 +365,7 @@ async def refresh_replays():
     return replay_service.get_replays_grouped(schedule_races=races)
 
 
-@app.get("/replays/video")
+@app.get("/api/replays/video")
 async def replay_video(
     request: Request,
     url: str = Query(..., description="Base64url-encoded video URL"),
@@ -425,7 +425,7 @@ async def replay_video(
         return Response(content=f"Proxy error: {e}", status_code=502)
 
 
-@app.get("/replays/download")
+@app.get("/api/replays/download")
 async def replay_download(
     url: str = Query(..., description="Base64url-encoded video URL"),
 ):

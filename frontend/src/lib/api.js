@@ -88,7 +88,7 @@ export async function deactivateStream(url) {
  * @returns {Promise<{events: Array, last_updated: string, total_posts: number}>}
  */
 export async function fetchReplays() {
-	const res = await fetch(`${API_BASE}/replays`);
+	const res = await fetch(`${API_BASE}/api/replays`);
 	if (!res.ok) throw new Error(`Replays fetch failed: ${res.status}`);
 	return res.json();
 }
@@ -98,7 +98,7 @@ export async function fetchReplays() {
  * @returns {Promise<{events: Array, last_updated: string, total_posts: number}>}
  */
 export async function refreshReplays() {
-	const res = await fetch(`${API_BASE}/replays/refresh`, { method: 'POST' });
+	const res = await fetch(`${API_BASE}/api/replays/refresh`, { method: 'POST' });
 	if (!res.ok) throw new Error(`Replays refresh failed: ${res.status}`);
 	return res.json();
 }
@@ -110,7 +110,7 @@ export async function refreshReplays() {
  */
 export function getReplayVideoUrl(videoUrl) {
 	const encoded = toBase64Url(videoUrl);
-	return `${API_BASE}/replays/video?url=${encoded}`;
+	return `${API_BASE}/api/replays/video?url=${encoded}`;
 }
 
 /**
@@ -120,5 +120,5 @@ export function getReplayVideoUrl(videoUrl) {
  */
 export function getReplayDownloadUrl(videoUrl) {
 	const encoded = toBase64Url(videoUrl);
-	return `${API_BASE}/replays/download?url=${encoded}`;
+	return `${API_BASE}/api/replays/download?url=${encoded}`;
 }
