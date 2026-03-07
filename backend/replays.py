@@ -1,5 +1,6 @@
 """Replay service — scrapes r/MotorsportsReplays for F1 replay links."""
 
+import asyncio
 import logging
 import re
 from dataclasses import dataclass, field
@@ -18,19 +19,19 @@ F1_FLAIRS = {"formula 1", "f1"}
 
 # Keyword-based filtering (fallback for unflaired posts)
 F1_KEYWORDS = {"formula 1", "formula one", "f1", "grand prix"}
-NON_F1_KEYWORDS = {
-    "motogp", "moto gp", "moto2", "moto3", "motoe",
-    "indycar", "indy car", "nascar", "rally", "wrc", "wec",
-    "lemans", "le mans", "superbike", "dtm", "supercars",
-    "formula e", "formula 2", "formula 3", "f2", "f3", "fe",
-}
+_NON_F1_RE = re.compile(
+    r"\b(?:motogp|moto\s?gp|moto2|moto3|motoe|indycar|indy\s?car|nascar|"
+    r"rally|wrc|wec|lemans|le\s+mans|superbike|dtm|supercars|"
+    r"formula\s+e|formula\s+2|formula\s+3|f2|f3|fe)\b",
+    re.IGNORECASE,
+)
 
-# Session type detection from post titles
+# Session type detection from post titles (more specific patterns first)
 SESSION_PATTERNS = [
-    (re.compile(r"\b(?:race)\b", re.IGNORECASE), "Race"),
-    (re.compile(r"\b(?:qualifying|quali|q1|q2|q3)\b", re.IGNORECASE), "Qualifying"),
     (re.compile(r"\b(?:sprint qualifying|sprint shootout|sq)\b", re.IGNORECASE), "Sprint Qualifying"),
     (re.compile(r"\b(?:sprint race|sprint)\b", re.IGNORECASE), "Sprint"),
+    (re.compile(r"\b(?:race)\b", re.IGNORECASE), "Race"),
+    (re.compile(r"\b(?:qualifying|quali|q1|q2|q3)\b", re.IGNORECASE), "Qualifying"),
     (re.compile(r"\b(?:free practice|practice|fp1|fp2|fp3)\b", re.IGNORECASE), "Practice"),
     (re.compile(r"\b(?:pre-race|pre race|build.?up)\b", re.IGNORECASE), "Pre-Race"),
 ]
@@ -88,8 +89,8 @@ def _is_f1_post(title: str, flair: str | None) -> bool:
     """Check if a Reddit post is F1-related via flair or title keywords."""
     lower_title = title.lower()
 
-    # Reject if it contains non-F1 motorsport keywords
-    if any(kw in lower_title for kw in NON_F1_KEYWORDS):
+    # Reject if it contains non-F1 motorsport keywords (word-boundary regex)
+    if _NON_F1_RE.search(title):
         return False
 
     # Flair-based (primary)
@@ -293,10 +294,16 @@ class ReplayService:
                         if not links:
                             continue
 
-                        # Resolve video URLs for streamable links
-                        for link in links:
-                            if link.link_type == "video" and "streamable.com" in link.url:
-                                video_url = await _resolve_streamable_url(link.url, client)
+                        # Collect streamable links for concurrent resolution
+                        streamable_links = [
+                            link for link in links
+                            if link.link_type == "video" and "streamable.com" in link.url
+                        ]
+                        if streamable_links:
+                            results = await asyncio.gather(
+                                *(_resolve_streamable_url(link.url, client) for link in streamable_links)
+                            )
+                            for link, video_url in zip(streamable_links, results):
                                 if video_url:
                                     link.video_url = video_url
 
@@ -361,6 +368,8 @@ class ReplayService:
                     "event_date": event_date,
                     "sessions": {},
                 }
+            elif event_date and events[event_name]["event_date"] is None:
+                events[event_name]["event_date"] = event_date
 
             session_type = post.session_type or "Other"
             if session_type not in events[event_name]["sessions"]:
