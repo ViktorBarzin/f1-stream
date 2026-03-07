@@ -389,8 +389,8 @@ async def replay_video(
     if range_header:
         headers_to_send["Range"] = range_header
 
+    client = httpx.AsyncClient(timeout=60.0, follow_redirects=True)
     try:
-        client = httpx.AsyncClient(timeout=60.0, follow_redirects=True)
         resp = await client.send(
             client.build_request("GET", decoded_url, headers=headers_to_send),
             stream=True,
@@ -420,6 +420,7 @@ async def replay_video(
         )
 
     except Exception as e:
+        await client.aclose()
         logger.exception("Replay video proxy error for %s", decoded_url)
         return Response(content=f"Proxy error: {e}", status_code=502)
 
@@ -442,8 +443,8 @@ async def replay_download(
     parsed = urlparse(decoded_url)
     filename = os.path.basename(parsed.path) or "replay.mp4"
 
+    client = httpx.AsyncClient(timeout=60.0, follow_redirects=True)
     try:
-        client = httpx.AsyncClient(timeout=60.0, follow_redirects=True)
         resp = await client.send(
             client.build_request("GET", decoded_url, headers={
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
@@ -473,6 +474,7 @@ async def replay_download(
         )
 
     except Exception as e:
+        await client.aclose()
         logger.exception("Replay download error for %s", decoded_url)
         return Response(content=f"Download error: {e}", status_code=502)
 
