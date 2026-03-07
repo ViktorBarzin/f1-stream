@@ -14,6 +14,7 @@
 			<div class="flex gap-4 text-sm">
 				<a href="/" class="text-f1-text-muted hover:text-white transition-colors">Schedule</a>
 				<a href="/watch" class="text-f1-text-muted hover:text-white transition-colors">Watch</a>
+				<a href="/replays" class="text-f1-text-muted hover:text-white transition-colors">Replays</a>
 			</div>
 		</nav>
 	</header>

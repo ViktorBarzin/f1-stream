@@ -82,3 +82,43 @@ export async function deactivateStream(url) {
 	if (!res.ok) throw new Error(`Deactivate failed: ${res.status}`);
 	return res.json();
 }
+
+/**
+ * Fetch F1 replay posts grouped by event.
+ * @returns {Promise<{events: Array, last_updated: string, total_posts: number}>}
+ */
+export async function fetchReplays() {
+	const res = await fetch(`${API_BASE}/replays`);
+	if (!res.ok) throw new Error(`Replays fetch failed: ${res.status}`);
+	return res.json();
+}
+
+/**
+ * Manually trigger a replay scrape refresh.
+ * @returns {Promise<{events: Array, last_updated: string, total_posts: number}>}
+ */
+export async function refreshReplays() {
+	const res = await fetch(`${API_BASE}/replays/refresh`, { method: 'POST' });
+	if (!res.ok) throw new Error(`Replays refresh failed: ${res.status}`);
+	return res.json();
+}
+
+/**
+ * Get the proxied video URL for inline HTML5 playback.
+ * @param {string} videoUrl - The original video URL
+ * @returns {string} The proxy video URL
+ */
+export function getReplayVideoUrl(videoUrl) {
+	const encoded = toBase64Url(videoUrl);
+	return `${API_BASE}/replays/video?url=${encoded}`;
+}
+
+/**
+ * Get the download URL for a replay video.
+ * @param {string} videoUrl - The original video URL
+ * @returns {string} The download URL
+ */
+export function getReplayDownloadUrl(videoUrl) {
+	const encoded = toBase64Url(videoUrl);
+	return `${API_BASE}/replays/download?url=${encoded}`;
+}
