@@ -4,6 +4,7 @@ import asyncio
 import logging
 import os
 import re
+import shlex
 import time
 from contextlib import asynccontextmanager
 from urllib.parse import quote
@@ -44,6 +45,10 @@ _active_torrents: dict[str, float] = {}  # hash → last_access_timestamp
 _torrent_file_names: dict[str, dict[int, str]] = {}  # hash → {file_index: basename}
 _torrents_lock = asyncio.Lock()
 _torrent_status_cache: tuple[bool, float] = (False, 0.0)  # (available, timestamp)
+_DIRECT_PLAY_FILE_EXTENSIONS = {".mp4", ".m4v", ".webm"}
+_DIRECT_PLAY_VIDEO_CODECS = {"h264", "hevc", "av1", "vp8", "vp9"}
+_DIRECT_PLAY_AUDIO_CODECS = {"aac", "mp3", "opus", "vorbis", "flac", "pcm_s16le", "pcm_s24le"}
+_MP4_COPY_VIDEO_CODECS = {"h264", "hevc", "av1"}
 
 
 # --- Pydantic models for request bodies ---
@@ -78,6 +83,116 @@ class TorrentHeartbeatRequest(BaseModel):
     """Request body for POST /api/replays/torrent-heartbeat."""
 
     hash: str
+
+
+async def _resolve_tracked_torrent_file_name(hash_value: str, index: int) -> str | None:
+    """Resolve a tracked torrent file name from cache or TorrServer metadata."""
+    async with _torrents_lock:
+        file_name = _torrent_file_names.get(hash_value, {}).get(index)
+
+    if file_name:
+        return file_name
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            get_resp = await client.post(
+                f"{TORRSERVER_URL}/torrents",
+                json={"action": "get", "hash": hash_value},
+            )
+            if get_resp.status_code != 200:
+                return None
+
+            data = get_resp.json()
+            file_stats = data.get("file_stats") or []
+            file_name_map: dict[int, str] = {}
+            for i, f in enumerate(file_stats):
+                try:
+                    file_index = int(f.get("id", i))
+                except (TypeError, ValueError):
+                    continue
+                file_path = str(f.get("path", f"file_{i}")).replace("\\", "/")
+                file_name_map[file_index] = file_path.rsplit("/", 1)[-1] or f"file_{file_index}"
+
+            if file_name_map:
+                async with _torrents_lock:
+                    _torrent_file_names[hash_value] = file_name_map
+                return file_name_map.get(index)
+    except Exception:
+        logger.debug("[torrent] Failed to resolve filename for hash=%s index=%d", hash_value, index, exc_info=True)
+
+    return None
+
+
+def _build_torrserver_stream_url(hash_value: str, index: int, file_name: str) -> str:
+    """Build the direct TorrServer URL for a specific file within a torrent."""
+    return f"{TORRSERVER_URL}/stream/{quote(file_name)}?link={hash_value}&index={index}&play"
+
+
+async def _probe_torrent_media_info(hash_value: str, index: int) -> dict:
+    """Inspect a torrent file and determine whether browsers can direct-play it."""
+    file_name = await _resolve_tracked_torrent_file_name(hash_value, index)
+    if not file_name:
+        raise ValueError("Unknown torrent file index")
+
+    _, ext = os.path.splitext(file_name.lower())
+    stream_url = _build_torrserver_stream_url(hash_value, index, file_name)
+
+    cmd = [
+        "ffprobe",
+        "-v", "error",
+        "-show_entries", "stream=index,codec_type,codec_name",
+        "-of", "json",
+        stream_url,
+    ]
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30.0)
+    except asyncio.TimeoutError as e:
+        raise RuntimeError("ffprobe timed out") from e
+    except FileNotFoundError as e:
+        raise RuntimeError("ffprobe is not installed in the backend image") from e
+
+    if proc.returncode != 0:
+        error_text = stderr.decode(errors="ignore").strip()
+        raise RuntimeError(error_text or f"ffprobe failed with exit code {proc.returncode}")
+
+    import json
+
+    probe_data = json.loads(stdout.decode() or "{}")
+    streams = probe_data.get("streams", [])
+    video_codecs = [s.get("codec_name", "") for s in streams if s.get("codec_type") == "video"]
+    audio_codecs = [s.get("codec_name", "") for s in streams if s.get("codec_type") == "audio"]
+
+    reasons: list[str] = []
+    direct_play_supported = True
+
+    if ext not in _DIRECT_PLAY_FILE_EXTENSIONS:
+        direct_play_supported = False
+        reasons.append(f"container {ext or 'unknown'} is not browser-friendly")
+
+    if video_codecs and any(codec not in _DIRECT_PLAY_VIDEO_CODECS for codec in video_codecs):
+        direct_play_supported = False
+        reasons.append(f"unsupported video codec(s): {', '.join(video_codecs)}")
+
+    if audio_codecs and any(codec not in _DIRECT_PLAY_AUDIO_CODECS for codec in audio_codecs):
+        direct_play_supported = False
+        reasons.append(f"unsupported audio codec(s): {', '.join(audio_codecs)}")
+
+    return {
+        "file_name": file_name,
+        "extension": ext,
+        "streams": streams,
+        "video_codecs": video_codecs,
+        "audio_codecs": audio_codecs,
+        "direct_play_supported": direct_play_supported,
+        "transcode_recommended": not direct_play_supported,
+        "reasons": reasons,
+    }
 
 
 # --- Scheduled callbacks ---
@@ -712,6 +827,33 @@ async def torrent_files(body: TorrentFilesRequest):
         return Response(content=f"TorrServer error: {e}", status_code=502)
 
 
+@app.get("/api/replays/torrent-media-info")
+async def torrent_media_info(
+    hash: str = Query(..., description="Torrent info hash (hex-40)"),
+    index: int = Query(..., description="File index within the torrent", ge=0),
+):
+    """Return browser playback compatibility info for a torrent file."""
+    if not _TORRENT_HASH_RE.match(hash):
+        return Response(content="Invalid hash format", status_code=400)
+
+    async with _torrents_lock:
+        if hash not in _active_torrents:
+            return Response(content="Unknown torrent hash", status_code=404)
+        _active_torrents[hash] = time.time()
+
+    try:
+        info = await _probe_torrent_media_info(hash, index)
+        return info
+    except ValueError as e:
+        return Response(content=str(e), status_code=404)
+    except RuntimeError as e:
+        logger.warning("[torrent] Media probe failed for hash=%s index=%d: %s", hash, index, e)
+        return Response(content=f"Media probe failed: {e}", status_code=502)
+    except Exception:
+        logger.exception("[torrent] Unexpected media probe failure for hash=%s index=%d", hash, index)
+        return Response(content="Unexpected media probe error", status_code=500)
+
+
 @app.get("/api/replays/torrent-stream")
 async def torrent_stream(
     request: Request,
@@ -727,39 +869,13 @@ async def torrent_stream(
         if hash not in _active_torrents:
             return Response(content="Unknown torrent hash", status_code=404)
         _active_torrents[hash] = time.time()
-        file_name = _torrent_file_names.get(hash, {}).get(index)
-
-    if not file_name:
-        try:
-            async with httpx.AsyncClient(timeout=10.0) as client:
-                get_resp = await client.post(
-                    f"{TORRSERVER_URL}/torrents",
-                    json={"action": "get", "hash": hash},
-                )
-                if get_resp.status_code == 200:
-                    data = get_resp.json()
-                    file_stats = data.get("file_stats") or []
-                    file_name_map: dict[int, str] = {}
-                    for i, f in enumerate(file_stats):
-                        try:
-                            file_index = int(f.get("id", i))
-                        except (TypeError, ValueError):
-                            continue
-                        file_path = str(f.get("path", f"file_{i}")).replace("\\", "/")
-                        file_name_map[file_index] = file_path.rsplit("/", 1)[-1] or f"file_{file_index}"
-
-                    file_name = file_name_map.get(index)
-                    if file_name_map:
-                        async with _torrents_lock:
-                            _torrent_file_names[hash] = file_name_map
-        except Exception:
-            logger.debug("[torrent] Failed to resolve filename for hash=%s index=%d", hash, index, exc_info=True)
+    file_name = await _resolve_tracked_torrent_file_name(hash, index)
 
     if not file_name:
         return Response(content="Unknown torrent file index", status_code=404)
 
     # Proxy the stream from TorrServer
-    stream_url = f"{TORRSERVER_URL}/stream/{quote(file_name)}?link={hash}&index={index}&play"
+    stream_url = _build_torrserver_stream_url(hash, index, file_name)
     range_header = request.headers.get("range")
     headers_to_send = {}
     if range_header:
@@ -799,6 +915,121 @@ async def torrent_stream(
         await client.aclose()
         logger.exception("[torrent] Stream proxy error for hash=%s index=%d", hash, index)
         return Response(content=f"Stream error: {e}", status_code=502)
+
+
+@app.get("/api/replays/torrent-stream-transcode")
+async def torrent_stream_transcode(
+    request: Request,
+    hash: str = Query(..., description="Torrent info hash (hex-40)"),
+    index: int = Query(..., description="File index within the torrent", ge=0),
+):
+    """Stream a torrent file with browser-safe MP4/AAC transcoding when needed."""
+    if not _TORRENT_HASH_RE.match(hash):
+        return Response(content="Invalid hash format", status_code=400)
+
+    async with _torrents_lock:
+        if hash not in _active_torrents:
+            return Response(content="Unknown torrent hash", status_code=404)
+        _active_torrents[hash] = time.time()
+
+    try:
+        media_info = await _probe_torrent_media_info(hash, index)
+    except ValueError as e:
+        return Response(content=str(e), status_code=404)
+    except RuntimeError as e:
+        logger.warning("[torrent] Media probe failed for transcode hash=%s index=%d: %s", hash, index, e)
+        return Response(content=f"Media probe failed: {e}", status_code=502)
+    except Exception:
+        logger.exception("[torrent] Unexpected media probe failure for transcode hash=%s index=%d", hash, index)
+        return Response(content="Unexpected media probe error", status_code=500)
+
+    if media_info["direct_play_supported"]:
+        return Response(
+            content="Direct play is supported for this file; use /api/replays/torrent-stream instead",
+            status_code=409,
+        )
+
+    if request.headers.get("range"):
+        return Response(content="Range requests are not supported for transcoded playback", status_code=416)
+
+    stream_url = _build_torrserver_stream_url(hash, index, media_info["file_name"])
+
+    video_codec = media_info["video_codecs"][0] if media_info["video_codecs"] else ""
+    copy_video = video_codec in _MP4_COPY_VIDEO_CODECS
+
+    ffmpeg_cmd = [
+        "ffmpeg",
+        "-hide_banner",
+        "-loglevel", "error",
+        "-nostdin",
+        "-i", stream_url,
+        "-map", "0:v:0?",
+        "-map", "0:a:0?",
+        "-c:v", "copy" if copy_video else "libx264",
+        "-c:a", "aac",
+        "-ac", "2",
+        "-b:a", "160k",
+        "-movflags", "frag_keyframe+empty_moov+default_base_moof",
+        "-f", "mp4",
+        "pipe:1",
+    ]
+
+    logger.info(
+        "[torrent] Transcoding hash=%s index=%d via ffmpeg: %s",
+        hash, index, " ".join(shlex.quote(part) for part in ffmpeg_cmd),
+    )
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *ffmpeg_cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+    except FileNotFoundError:
+        return Response(content="ffmpeg is not installed in the backend image", status_code=500)
+    except Exception as e:
+        logger.exception("[torrent] Failed to start ffmpeg transcode for hash=%s index=%d", hash, index)
+        return Response(content=f"Failed to start transcoder: {e}", status_code=500)
+
+    async def stream_transcoded():
+        stderr_buffer = bytearray()
+        try:
+            while True:
+                chunk = await proc.stdout.read(65536)
+                if not chunk:
+                    break
+                yield chunk
+
+            if proc.stderr:
+                stderr_output = await proc.stderr.read()
+                if stderr_output:
+                    stderr_buffer.extend(stderr_output)
+        finally:
+            if proc.returncode is None:
+                try:
+                    proc.kill()
+                except ProcessLookupError:
+                    pass
+            await proc.wait()
+            if proc.stderr and not stderr_buffer:
+                try:
+                    stderr_output = await proc.stderr.read()
+                    if stderr_output:
+                        stderr_buffer.extend(stderr_output)
+                except Exception:
+                    pass
+            if proc.returncode not in (0, None) and stderr_buffer:
+                logger.warning(
+                    "[torrent] ffmpeg transcode exited with code %s for hash=%s index=%d: %s",
+                    proc.returncode, hash, index, stderr_buffer.decode(errors="ignore")[:2000],
+                )
+
+    response_headers = {
+        "Content-Type": "video/mp4",
+        "Accept-Ranges": "none",
+        "X-Transcode": "audio-aac",
+    }
+    return StreamingResponse(stream_transcoded(), status_code=200, headers=response_headers)
 
 
 @app.post("/api/replays/torrent-stop")

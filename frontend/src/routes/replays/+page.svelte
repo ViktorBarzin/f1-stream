@@ -1,7 +1,7 @@
 <script>
 	import {
 		fetchReplays, refreshReplays, getReplayVideoUrl, getReplayDownloadUrl,
-		checkTorrserverStatus, fetchTorrentFiles, getTorrentStreamUrl,
+		checkTorrserverStatus, fetchTorrentFiles, getTorrentStreamUrl, fetchTorrentMediaInfo, getTorrentTranscodeStreamUrl,
 		stopTorrentStream, sendTorrentHeartbeat
 	} from '$lib/api.js';
 	import { onMount } from 'svelte';
@@ -21,6 +21,8 @@
 	let torrentFilePickerFor = $state(null); // key string identifying which magnet link opened the picker
 	let torrentPlayerKey = $state(null); // key string for active torrent player
 	let torrentPlayerUrl = $state(null); // stream URL for active torrent player
+	let torrentPlayerTranscoded = $state(false); // whether current player is using ffmpeg transcode
+	let torrentPlayerInfo = $state(null); // compatibility info for current torrent file
 	let torrentBuffering = $state(false); // buffering spinner overlay
 	let torrentError = $state(null); // error message for torrent player
 	let copiedMagnet = $state(null); // key string for "Copied!" feedback
@@ -191,9 +193,22 @@
 		}
 	}
 
-	function startTorrentPlayback(key, hash, fileIndex) {
+	async function startTorrentPlayback(key, hash, fileIndex) {
+		let mediaInfo = null;
+		try {
+			mediaInfo = await fetchTorrentMediaInfo(hash, fileIndex);
+		} catch (e) {
+			console.warn('Failed to fetch torrent media info', e);
+		}
+
+		const useTranscode = !!mediaInfo?.transcode_recommended;
+
 		torrentPlayerKey = key;
-		torrentPlayerUrl = getTorrentStreamUrl(hash, fileIndex);
+		torrentPlayerUrl = useTranscode
+			? getTorrentTranscodeStreamUrl(hash, fileIndex)
+			: getTorrentStreamUrl(hash, fileIndex);
+		torrentPlayerTranscoded = useTranscode;
+		torrentPlayerInfo = mediaInfo;
 		torrentBuffering = true;
 		torrentError = null;
 		torrentFilePickerFor = null; // close picker
@@ -247,6 +262,8 @@
 		}
 		torrentPlayerKey = null;
 		torrentPlayerUrl = null;
+		torrentPlayerTranscoded = false;
+		torrentPlayerInfo = null;
 		torrentBuffering = false;
 		torrentError = null;
 		torrentFiles = null;
@@ -292,6 +309,11 @@
 			}
 		}
 		return best;
+	}
+
+	function getTranscodeReasonText(info) {
+		if (!info?.reasons?.length) return '';
+		return info.reasons.join('; ');
 	}
 </script>
 
@@ -536,6 +558,17 @@
 															>
 																<track kind="captions" />
 															</video>
+															{#if torrentPlayerTranscoded}
+																<div class="px-3 py-2 text-xs bg-amber-950/80 text-amber-200 border-t border-amber-600/30">
+																	<div class="font-medium">Audio compatibility mode enabled</div>
+																	<div class="mt-1 text-amber-200/80">
+																		This replay is being transcoded for browser-safe audio playback.
+																		{#if torrentPlayerInfo}
+																			<span class="block mt-1">{getTranscodeReasonText(torrentPlayerInfo)}</span>
+																		{/if}
+																	</div>
+																</div>
+															{/if}
 															<div class="flex justify-end p-1 bg-f1-surface">
 																<button onclick={closeTorrentPlayer} class="text-xs text-f1-text-muted hover:text-white px-2 py-0.5">✕ Close player</button>
 															</div>

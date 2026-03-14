@@ -167,6 +167,31 @@ export function getTorrentStreamUrl(hash, fileIndex) {
 }
 
 /**
+ * Get browser playback compatibility info for a torrent file.
+ * @param {string} hash - The torrent info hash
+ * @param {number} fileIndex - The file index within the torrent
+ * @returns {Promise<{direct_play_supported: boolean, transcode_recommended: boolean, reasons: string[]}>}
+ */
+export async function fetchTorrentMediaInfo(hash, fileIndex) {
+	const res = await fetch(`${API_BASE}/api/replays/torrent-media-info?hash=${encodeURIComponent(hash)}&index=${fileIndex}`);
+	if (!res.ok) {
+		const text = await res.text().catch(() => '');
+		throw new Error(`Torrent media info failed: ${res.status} ${text}`);
+	}
+	return res.json();
+}
+
+/**
+ * Get the torrent stream URL with browser-safe transcoding.
+ * @param {string} hash - The torrent info hash
+ * @param {number} fileIndex - The file index within the torrent
+ * @returns {string} The transcoded stream URL
+ */
+export function getTorrentTranscodeStreamUrl(hash, fileIndex) {
+	return `${API_BASE}/api/replays/torrent-stream-transcode?hash=${encodeURIComponent(hash)}&index=${fileIndex}`;
+}
+
+/**
  * Stop a torrent stream and clean up resources.
  * @param {string} hash - The torrent info hash
  */
