@@ -130,6 +130,27 @@ class ReplayPost:
         }
 
 
+_LINK_TYPE_PRIORITY = {
+    "video": 0,     # direct HTTP file playback is fastest
+    "embed": 1,     # browser-viewable HTTP source
+    "external": 2,  # HTTP link, but may need another hop/tab
+    "magnet": 3,    # torrents are slowest to start
+}
+
+
+def _sort_links(links: list[ReplayLink]) -> list[ReplayLink]:
+    """Sort replay links so HTTP-based playback options appear before torrents."""
+    return sorted(
+        links,
+        key=lambda link: (
+            _LINK_TYPE_PRIORITY.get(link.link_type, 99),
+            0 if link.video_url else 1,
+            link.label.lower(),
+            link.url.lower(),
+        ),
+    )
+
+
 def _is_f1_post(title: str, flair: str | None) -> bool:
     """Check if a Reddit post is F1-related via flair or title keywords."""
     lower_title = title.lower()
@@ -530,6 +551,8 @@ class ReplayService:
                                 if video_url:
                                     link.video_url = video_url
 
+                        links = _sort_links(links)
+
                         permalink = post_data.get("permalink", "")
                         reddit_url = f"https://www.reddit.com{permalink}" if permalink else ""
 
@@ -603,6 +626,7 @@ class ReplayService:
                                 added += 1
 
                             if added > 0:
+                                post.links = _sort_links(post.links)
                                 logger.debug("[replays] Added %d links from comments for: %s", added, post.title)
 
                         comment_enriched += 1
