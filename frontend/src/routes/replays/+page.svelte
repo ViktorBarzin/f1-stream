@@ -244,7 +244,7 @@
 			try {
 				const hlsStream = await fetchTorrentTranscodeHlsStream(hash, fileIndex);
 				torrentPlayerUrl = hlsStream.playlist_url;
-				torrentStatusText = 'Preparing browser-compatible replay audio...';
+				torrentStatusText = 'Preparing browser-compatible replay audio (this can take a minute)...';
 			} catch (e) {
 				torrentBuffering = false;
 				torrentStatusText = null;

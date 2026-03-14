@@ -324,8 +324,7 @@ async def _ensure_hls_transcode_session(hash_value: str, index: int, media_info:
         async with _torrents_lock:
             existing = _torrent_hls_sessions.get(hash_value, {}).get(index)
             if existing:
-                playlist_path = Path(existing["playlist_path"])
-                if existing["process"].returncode is None and playlist_path.exists():
+                if existing["process"].returncode is None:
                     existing["last_access"] = time.time()
                     _active_torrents[hash_value] = time.time()
                     return existing
@@ -403,18 +402,6 @@ async def _ensure_hls_transcode_session(hash_value: str, index: int, media_info:
             _torrent_hls_sessions.setdefault(hash_value, {})[index] = session
             _active_torrents[hash_value] = time.time()
 
-        try:
-            await _wait_for_hls_output(playlist_path, session, timeout=20.0)
-        except Exception:
-            async with _torrents_lock:
-                current = _torrent_hls_sessions.get(hash_value, {}).get(index)
-                if current is session:
-                    _torrent_hls_sessions[hash_value].pop(index, None)
-                    if not _torrent_hls_sessions.get(hash_value):
-                        _torrent_hls_sessions.pop(hash_value, None)
-            await _cleanup_hls_session(session)
-            raise
-
         return session
 
 
@@ -427,7 +414,8 @@ async def _resolve_hls_output_file(hash_value: str, index: int, file_name: str) 
     session = await _ensure_hls_transcode_session(hash_value, index, media_info)
     file_path = Path(session["output_dir"]) / file_name
 
-    await _wait_for_hls_output(file_path, session, timeout=20.0)
+    wait_timeout = 90.0 if file_name == "stream.m3u8" else 30.0
+    await _wait_for_hls_output(file_path, session, timeout=wait_timeout)
 
     async with _torrents_lock:
         active = _torrent_hls_sessions.get(hash_value, {}).get(index)
@@ -1319,18 +1307,19 @@ async def torrent_stream_transcode_hls(
         )
 
     try:
-        await _resolve_hls_output_file(hash, index, "stream.m3u8")
+        await _ensure_hls_transcode_session(hash, index, media_info)
     except RuntimeError as e:
-        logger.warning("[torrent] HLS transcode startup failed for hash=%s index=%d: %s", hash, index, e)
+        logger.warning("[torrent] HLS transcode launch failed for hash=%s index=%d: %s", hash, index, e)
         return Response(content=f"HLS transcode failed: {e}", status_code=502)
     except Exception:
-        logger.exception("[torrent] Unexpected HLS transcode failure for hash=%s index=%d", hash, index)
+        logger.exception("[torrent] Unexpected HLS transcode launch failure for hash=%s index=%d", hash, index)
         return Response(content="Unexpected HLS transcode error", status_code=500)
 
     return {
         "playlist_url": f"/api/replays/torrent-transcode-files/{hash}/{index}/stream.m3u8",
         "segment_prefix": f"/api/replays/torrent-transcode-files/{hash}/{index}/",
         "mode": "hls-audio-aac",
+        "starting": True,
     }
 
 
