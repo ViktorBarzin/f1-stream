@@ -8,6 +8,15 @@ clone:
     settings:
       attempts: 5
       backoff: 10s
+    backend_options:
+      kubernetes:
+        resources:
+          requests:
+            memory: 256Mi
+            cpu: 250m
+          limits:
+            memory: 512Mi
+            cpu: 500m
 
 steps:
   - name: build-and-push
@@ -25,6 +34,15 @@ steps:
       provenance: false
       tags:
         - ${CI_COMMIT_SHA}
+    backend_options:
+      kubernetes:
+        resources:
+          requests:
+            memory: 1Gi
+            cpu: "1"
+          limits:
+            memory: 3Gi
+            cpu: "2"
 
   - name: deploy
     image: docker.io/library/alpine
@@ -61,6 +79,15 @@ steps:
               }
             }
           }" | jq '.status.conditions // "Patch applied"'
+    backend_options:
+      kubernetes:
+        resources:
+          requests:
+            memory: 256Mi
+            cpu: 250m
+          limits:
+            memory: 512Mi
+            cpu: 500m
 
   - name: verify-deploy
     image: docker.io/library/alpine
@@ -97,3 +124,12 @@ steps:
         echo "ERROR: Deployment did not stabilize within 5 minutes"
         curl -sk "$API/status" -H "Authorization: Bearer $TOKEN" | jq '.status'
         exit 1
+    backend_options:
+      kubernetes:
+        resources:
+          requests:
+            memory: 256Mi
+            cpu: 250m
+          limits:
+            memory: 512Mi
+            cpu: 500m
