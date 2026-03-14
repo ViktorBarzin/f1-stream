@@ -1,7 +1,18 @@
 #!/usr/bin/env bash
-set -e
+set -euo pipefail
 
-docker buildx build --platform linux/amd64 --provenance=false \
-  -t viktorbarzin/f1-stream:v2.0.1 -t viktorbarzin/f1-stream:latest \
-  --push .
-kubectl -n f1-stream rollout restart deployment f1-stream
+BRANCH="$(git rev-parse --abbrev-ref HEAD)"
+
+if [[ "$BRANCH" != "main" ]]; then
+  echo "Remote deploys only run from main. Current branch: $BRANCH"
+  exit 1
+fi
+
+if [[ -n "$(git status --porcelain)" ]]; then
+  echo "Working tree is not clean. Commit or stash changes before remote deploy."
+  exit 1
+fi
+
+echo "Pushing main to origin..."
+git push origin main
+echo "Push complete. Woodpecker will build and deploy f1-stream remotely."

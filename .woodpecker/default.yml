@@ -1,0 +1,108 @@
+when:
+  - event: push
+    branch: main
+
+clone:
+  git:
+    image: woodpeckerci/plugin-git
+    settings:
+      attempts: 5
+      backoff: 10s
+
+steps:
+  - name: build-and-push
+    image: woodpeckerci/plugin-docker-buildx
+    settings:
+      username: viktorbarzin
+      password:
+        from_secret: dockerhub-pat
+      repo:
+        - viktorbarzin/f1-stream
+        - registry.viktorbarzin.me:5050/f1-stream
+      logins:
+        - registry: https://index.docker.io/v1/
+          username: viktorbarzin
+          password:
+            from_secret: dockerhub-pat
+      dockerfile: Dockerfile
+      context: .
+      platforms:
+        - linux/amd64
+      provenance: false
+      tags:
+        - latest
+        - ${CI_COMMIT_SHA}
+      cache_from: registry.viktorbarzin.me:5050/f1-stream:latest
+      cache_to: type=inline
+
+  - name: deploy
+    image: docker.io/library/alpine
+    depends_on:
+      - build-and-push
+    commands:
+      - apk add --no-cache curl jq
+      - |
+        TOKEN=$(cat /var/run/secrets/kubernetes.io/serviceaccount/token)
+        IMAGE="viktorbarzin/f1-stream:${CI_COMMIT_SHA}"
+        RESTART_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+        API="https://kubernetes:6443/apis/apps/v1/namespaces/f1-stream/deployments/f1-stream"
+
+        echo "Deploying ${IMAGE}"
+
+        curl -sS -X PATCH "$API" \
+          -H "Authorization: Bearer $TOKEN" \
+          -H "Content-Type: application/strategic-merge-patch+json" \
+          -k \
+          -d "{
+            \"spec\": {
+              \"template\": {
+                \"metadata\": {
+                  \"annotations\": {
+                    \"ci.woodpecker/restartedAt\": \"$RESTART_AT\"
+                  }
+                },
+                \"spec\": {
+                  \"containers\": [{
+                    \"name\": \"f1-stream\",
+                    \"image\": \"$IMAGE\"
+                  }]
+                }
+              }
+            }
+          }" | jq '.status.conditions // "Patch applied"'
+
+  - name: verify-deploy
+    image: docker.io/library/alpine
+    depends_on:
+      - deploy
+    commands:
+      - apk add --no-cache curl jq
+      - |
+        TOKEN=$(cat /var/run/secrets/kubernetes.io/serviceaccount/token)
+        API="https://kubernetes:6443/apis/apps/v1/namespaces/f1-stream/deployments/f1-stream"
+        TARGET_IMAGE="viktorbarzin/f1-stream:${CI_COMMIT_SHA}"
+
+        echo "Waiting for deployment to roll out with image ${TARGET_IMAGE}..."
+
+        for i in $(seq 1 60); do
+          DEPLOYMENT_JSON=$(curl -sk "$API" -H "Authorization: Bearer $TOKEN")
+          READY=$(echo "$DEPLOYMENT_JSON" | jq -r '.status.readyReplicas // 0')
+          UPDATED=$(echo "$DEPLOYMENT_JSON" | jq -r '.status.updatedReplicas // 0')
+          AVAILABLE=$(echo "$DEPLOYMENT_JSON" | jq -r '.status.availableReplicas // 0')
+          CURRENT_IMAGE=$(echo "$DEPLOYMENT_JSON" | jq -r '.spec.template.spec.containers[] | select(.name == "f1-stream") | .image')
+
+          if [ "$CURRENT_IMAGE" = "$TARGET_IMAGE" ] && [ "$READY" -ge 1 ] && [ "$UPDATED" -ge 1 ] && [ "$AVAILABLE" -ge 1 ]; then
+            echo "Deployment verified: ready=$READY updated=$UPDATED available=$AVAILABLE image=$CURRENT_IMAGE"
+            exit 0
+          fi
+
+          if [ "$i" -eq 1 ] || [ "$i" -eq 10 ] || [ "$i" -eq 30 ] || [ "$i" -eq 60 ]; then
+            echo "Attempt $i/60: ready=$READY updated=$UPDATED available=$AVAILABLE image=$CURRENT_IMAGE"
+          fi
+
+          sleep 5
+        done
+
+        echo "ERROR: Deployment did not stabilize within 5 minutes"
+        curl -sk "$API/status" -H "Authorization: Bearer $TOKEN" | jq '.status'
+        exit 1
