@@ -172,6 +172,21 @@
 		return SESSION_ORDER[type] ?? 99;
 	}
 
+	function buildSessionLinks(posts, eventIdx, sessionType) {
+		return posts.flatMap((post, postIdx) =>
+			post.links.map((link, linkIdx) => ({
+				key: `${eventIdx}-${sessionType}-${postIdx}-${linkIdx}`,
+				postTitle: post.title,
+				redditUrl: post.reddit_url,
+				createdUtc: post.created_utc,
+				flair: post.flair,
+				link,
+				postIdx,
+				linkIdx
+			}))
+		);
+	}
+
 	// --- Torrent streaming functions ---
 
 	function magnetKey(eventIdx, sessionType, postIdx, linkIdx) {
@@ -575,43 +590,58 @@
 							<div class="border-t border-f1-border">
 								{#each sessionTypes as sessionType}
 									{@const posts = event.sessions[sessionType]}
+									{@const sessionLinks = buildSessionLinks(posts, eventIdx, sessionType)}
 									<div class="border-b border-f1-border last:border-b-0">
 										<!-- Session Header -->
-										<div class="px-4 py-2 bg-f1-bg/50">
+										<div class="px-4 py-2 bg-f1-bg/50 flex items-center justify-between gap-3">
 											<h3 class="text-sm font-medium text-f1-text-muted uppercase tracking-wider">{sessionType}</h3>
+											<span class="text-[11px] text-f1-text-muted">
+												{sessionLinks.length} link{sessionLinks.length !== 1 ? 's' : ''}
+											</span>
 										</div>
 
-										<!-- Posts in this session -->
-										{#each posts as post, postIdx}
-											<div class="px-4 py-3 {postIdx > 0 ? 'border-t border-f1-border/50' : ''}">
-												<!-- Post title & meta -->
-												<div class="flex items-start justify-between gap-2 mb-2">
-													<div class="flex-1 min-w-0">
-														<p class="text-sm text-white">{post.title}</p>
-														<div class="flex items-center gap-2 mt-1">
-															<span class="text-xs text-f1-text-muted">{formatTimeAgo(post.created_utc)}</span>
-															{#if post.flair}
-																<span class="text-[10px] px-1.5 py-0.5 rounded bg-f1-red/20 text-f1-red border border-f1-red/30">{post.flair}</span>
-															{/if}
+										<!-- Links in this session -->
+										<div class="px-4 py-3 space-y-3">
+											{#each sessionLinks as item, itemIdx (item.key)}
+												{@const link = item.link}
+												{@const linkTypeBadge = getLinkTypeBadge(link)}
+												<div class="rounded-lg border border-f1-border/70 bg-f1-bg/40 p-3">
+													<div class="flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
+														<div class="min-w-0 flex-1">
+															<div class="flex flex-wrap items-center gap-2">
+																<h4 class="text-sm font-medium text-white">{link.label}</h4>
+																<span
+																	class="px-1.5 py-0.5 rounded border text-[10px] font-medium {linkTypeBadge.className}"
+																	title={linkTypeBadge.hint}
+																>
+																	{linkTypeBadge.label}
+																</span>
+																<span class="text-[10px] uppercase tracking-wide text-f1-text-muted">
+																	Source {itemIdx + 1}
+																</span>
+															</div>
+															<p class="mt-2 text-xs text-f1-text-muted break-words">
+																From: <span class="text-f1-text">{item.postTitle}</span>
+															</p>
+															<div class="mt-1 flex flex-wrap items-center gap-2">
+																<span class="text-xs text-f1-text-muted">{formatTimeAgo(item.createdUtc)}</span>
+																{#if item.flair}
+																	<span class="text-[10px] px-1.5 py-0.5 rounded bg-f1-red/20 text-f1-red border border-f1-red/30">{item.flair}</span>
+																{/if}
+																<a href={item.redditUrl} target="_blank" rel="noopener" class="text-xs text-f1-text-muted hover:text-white transition-colors">
+																	Reddit
+																</a>
+															</div>
 														</div>
-													</div>
-													<a href={post.reddit_url} target="_blank" rel="noopener" class="shrink-0 text-xs text-f1-text-muted hover:text-white transition-colors">
-														Reddit
-													</a>
-												</div>
 
-												<!-- Links -->
-												<div class="flex flex-wrap gap-2">
-													{#each post.links as link, linkIdx}
-														{@const linkTypeBadge = getLinkTypeBadge(link)}
-														{#if link.link_type === 'video'}
-															<div class="flex items-center gap-1.5">
+														<div class="flex flex-wrap items-center gap-2 lg:justify-end">
+															{#if link.link_type === 'video'}
 																<button
-																	onclick={() => playVideo(eventIdx, sessionType, postIdx, linkIdx, link)}
+																	onclick={() => playVideo(eventIdx, sessionType, item.postIdx, item.linkIdx, link)}
 																	class="flex items-center gap-1 px-2.5 py-1 rounded text-xs font-medium bg-green-600/20 text-green-300 border border-green-500/30 hover:bg-green-600/30 transition-colors"
 																>
 																	<svg class="w-3 h-3" fill="currentColor" viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg>
-																	{link.label}
+																	{isVideoActive(eventIdx, sessionType, item.postIdx, item.linkIdx) ? 'Hide player' : 'Play now'}
 																</button>
 																<a
 																	href={getDownloadHref(link)}
@@ -619,42 +649,32 @@
 																	title="Download"
 																>
 																	<svg class="w-3 h-3" fill="currentColor" viewBox="0 0 24 24"><path d="M19 9h-4V3H9v6H5l7 7 7-7zM5 18v2h14v-2H5z"/></svg>
+																	Download
 																</a>
-																<span
-																	class="px-1.5 py-0.5 rounded border text-[10px] font-medium {linkTypeBadge.className}"
+															{:else if link.link_type === 'embed'}
+																<a
+																	href={link.url}
+																	target="_blank"
+																	rel="noopener"
+																	class="flex items-center gap-1.5 px-2.5 py-1 rounded text-xs font-medium bg-purple-600/20 text-purple-300 border border-purple-500/30 hover:bg-purple-600/30 transition-colors"
 																	title={linkTypeBadge.hint}
 																>
-																	{linkTypeBadge.label}
-																</span>
-															</div>
-														{:else if link.link_type === 'embed'}
-															<a
-																href={link.url}
-																target="_blank"
-																rel="noopener"
-																class="flex items-center gap-1.5 px-2.5 py-1 rounded text-xs font-medium bg-purple-600/20 text-purple-300 border border-purple-500/30 hover:bg-purple-600/30 transition-colors"
-																title={linkTypeBadge.hint}
-															>
-																<svg class="w-3 h-3" fill="currentColor" viewBox="0 0 24 24"><path d="M21 3H3c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h18c1.1 0 2-.9 2-2V5c0-1.1-.9-2-2-2zm0 16H3V5h18v14zM9 8l7 4-7 4V8z"/></svg>
-																{link.label}
-																<span class="px-1.5 py-0.5 rounded border text-[10px] font-medium {linkTypeBadge.className}">
-																	{linkTypeBadge.label}
-																</span>
-															</a>
-														{:else if link.link_type === 'magnet'}
-															<div class="flex items-center gap-1.5">
+																	<svg class="w-3 h-3" fill="currentColor" viewBox="0 0 24 24"><path d="M21 3H3c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h18c1.1 0 2-.9 2-2V5c0-1.1-.9-2-2-2zm0 16H3V5h18v14zM9 8l7 4-7 4V8z"/></svg>
+																	Open web player
+																</a>
+															{:else if link.link_type === 'magnet'}
 																{#if torrserverAvailable}
 																	<button
-																		onclick={() => handleMagnetStream(eventIdx, sessionType, postIdx, linkIdx, link.url)}
+																		onclick={() => handleMagnetStream(eventIdx, sessionType, item.postIdx, item.linkIdx, link.url)}
 																		disabled={torrentStreamLoading}
 																		class="flex items-center gap-1 px-2.5 py-1 rounded text-xs font-medium bg-orange-600/20 text-orange-300 border border-orange-500/30 hover:bg-orange-600/30 transition-colors disabled:opacity-50"
 																	>
-																		{#if torrentStreamLoading && torrentFilePickerFor === magnetKey(eventIdx, sessionType, postIdx, linkIdx)}
+																		{#if torrentStreamLoading && torrentFilePickerFor === magnetKey(eventIdx, sessionType, item.postIdx, item.linkIdx)}
 																			<svg class="w-3 h-3 animate-spin" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/></svg>
 																		{:else}
 																			<svg class="w-3 h-3" fill="currentColor" viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg>
 																		{/if}
-																		Stream
+																		{torrentPlayerKey === magnetKey(eventIdx, sessionType, item.postIdx, item.linkIdx) ? 'Playing' : 'Stream'}
 																	</button>
 																{:else}
 																	<span
@@ -662,52 +682,37 @@
 																		title="TorrServer not configured"
 																	>
 																		<svg class="w-3 h-3" fill="currentColor" viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg>
-																		Stream
+																		Stream unavailable
 																	</span>
 																{/if}
 																<button
-																	onclick={() => copyMagnet(eventIdx, sessionType, postIdx, linkIdx, link.url)}
+																	onclick={() => copyMagnet(eventIdx, sessionType, item.postIdx, item.linkIdx, link.url)}
 																	class="flex items-center gap-1 px-2 py-1 rounded text-xs font-medium bg-orange-600/20 text-orange-300 border border-orange-500/30 hover:bg-orange-600/30 transition-colors"
 																	title="Copy magnet link"
 																>
-																	{#if copiedMagnet === magnetKey(eventIdx, sessionType, postIdx, linkIdx)}
+																	{#if copiedMagnet === magnetKey(eventIdx, sessionType, item.postIdx, item.linkIdx)}
 																		✓ Copied
 																	{:else}
 																		<svg class="w-3 h-3" fill="currentColor" viewBox="0 0 24 24"><path d="M16 1H4c-1.1 0-2 .9-2 2v14h2V3h12V1zm3 4H8c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h11c1.1 0 2-.9 2-2V7c0-1.1-.9-2-2-2zm0 16H8V7h11v14z"/></svg>
-																		Copy
+																		Copy magnet
 																	{/if}
 																</button>
-																<span class="text-[10px] text-orange-400/70 ml-0.5 max-w-[120px] truncate" title={link.label}>
-																	{link.label}
-																</span>
-																<span
-																	class="px-1.5 py-0.5 rounded border text-[10px] font-medium {linkTypeBadge.className}"
+															{:else}
+																<a
+																	href={link.url}
+																	target="_blank"
+																	rel="noopener"
+																	class="flex items-center gap-1.5 px-2.5 py-1 rounded text-xs font-medium bg-gray-600/20 text-gray-300 border border-gray-500/30 hover:bg-gray-600/30 transition-colors"
 																	title={linkTypeBadge.hint}
 																>
-																	{linkTypeBadge.label}
-																</span>
-															</div>
-														{:else}
-															<a
-																href={link.url}
-																target="_blank"
-																rel="noopener"
-																class="flex items-center gap-1.5 px-2.5 py-1 rounded text-xs font-medium bg-gray-600/20 text-gray-300 border border-gray-500/30 hover:bg-gray-600/30 transition-colors"
-																title={linkTypeBadge.hint}
-															>
-																<svg class="w-3 h-3" fill="currentColor" viewBox="0 0 24 24"><path d="M19 19H5V5h7V3H5c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h14c1.1 0 2-.9 2-2v-7h-2v7zM14 3v2h3.59l-9.83 9.83 1.41 1.41L19 6.41V10h2V3h-7z"/></svg>
-																{link.label}
-																<span class="px-1.5 py-0.5 rounded border text-[10px] font-medium {linkTypeBadge.className}">
-																	{linkTypeBadge.label}
-																</span>
-															</a>
-														{/if}
-													{/each}
-												</div>
+																	<svg class="w-3 h-3" fill="currentColor" viewBox="0 0 24 24"><path d="M19 19H5V5h7V3H5c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h14c1.1 0 2-.9 2-2v-7h-2v7zM14 3v2h3.59l-9.83 9.83 1.41 1.41L19 6.41V10h2V3h-7z"/></svg>
+																	Open link
+																</a>
+															{/if}
+														</div>
+													</div>
 
-												<!-- Torrent file picker -->
-												{#each post.links as link, linkIdx}
-													{#if link.link_type === 'magnet' && torrentFilePickerFor === magnetKey(eventIdx, sessionType, postIdx, linkIdx) && torrentFiles}
+													{#if link.link_type === 'magnet' && torrentFilePickerFor === magnetKey(eventIdx, sessionType, item.postIdx, item.linkIdx) && torrentFiles}
 														{@const defaultIdx = getLargestVideoIndex(torrentFiles.files)}
 														<div class="mt-3 bg-f1-bg border border-orange-500/30 rounded-lg p-3">
 															<div class="flex items-center justify-between mb-2">
@@ -720,7 +725,7 @@
 															<div class="space-y-1 max-h-[200px] overflow-y-auto" role="listbox" aria-label="Torrent files">
 																{#each torrentFiles.files as file}
 																	<button
-																		onclick={() => startTorrentPlayback(magnetKey(eventIdx, sessionType, postIdx, linkIdx), torrentFiles.hash, file.index)}
+																		onclick={() => startTorrentPlayback(magnetKey(eventIdx, sessionType, item.postIdx, item.linkIdx), torrentFiles.hash, file.index)}
 																		class="w-full flex items-center justify-between px-3 py-1.5 rounded text-xs hover:bg-f1-surface-hover transition-colors text-left {file.index === defaultIdx ? 'bg-orange-600/10 border border-orange-500/20' : ''}"
 																		role="option"
 																		aria-selected={file.index === defaultIdx}
@@ -732,11 +737,8 @@
 															</div>
 														</div>
 													{/if}
-												{/each}
 
-												<!-- Torrent video player -->
-												{#each post.links as link, linkIdx}
-													{#if link.link_type === 'magnet' && torrentPlayerKey === magnetKey(eventIdx, sessionType, postIdx, linkIdx)}
+													{#if link.link_type === 'magnet' && torrentPlayerKey === magnetKey(eventIdx, sessionType, item.postIdx, item.linkIdx)}
 														<div class="mt-3 rounded-lg overflow-hidden bg-black relative">
 															{#if torrentBuffering}
 																<div class="absolute inset-0 flex flex-col items-center justify-center bg-black/80 z-10">
@@ -804,11 +806,8 @@
 															</div>
 														</div>
 													{/if}
-												{/each}
 
-												<!-- Inline video player -->
-												{#each post.links as link, linkIdx}
-													{#if link.link_type === 'video' && isVideoActive(eventIdx, sessionType, postIdx, linkIdx)}
+													{#if link.link_type === 'video' && isVideoActive(eventIdx, sessionType, item.postIdx, item.linkIdx)}
 														<div class="mt-3 rounded-lg overflow-hidden bg-black">
 															<video
 																src={getVideoSrc(link)}
@@ -831,9 +830,9 @@
 															</div>
 														</div>
 													{/if}
-												{/each}
-											</div>
-										{/each}
+												</div>
+											{/each}
+										</div>
 									</div>
 								{/each}
 							</div>
