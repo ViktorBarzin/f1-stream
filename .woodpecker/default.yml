@@ -18,22 +18,13 @@ steps:
         from_secret: dockerhub-pat
       repo:
         - viktorbarzin/f1-stream
-        - registry.viktorbarzin.me:5050/f1-stream
-      logins:
-        - registry: https://index.docker.io/v1/
-          username: viktorbarzin
-          password:
-            from_secret: dockerhub-pat
       dockerfile: Dockerfile
       context: .
       platforms:
         - linux/amd64
       provenance: false
       tags:
-        - latest
         - ${CI_COMMIT_SHA}
-      cache_from: registry.viktorbarzin.me:5050/f1-stream:latest
-      cache_to: type=inline
 
   - name: deploy
     image: docker.io/library/alpine
