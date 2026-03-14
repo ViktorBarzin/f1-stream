@@ -91,11 +91,16 @@ EMBED_DOMAINS = {"rerace.io", "f1full.com", "f1fullraces.com"}
 # URL extraction from selftext markdown
 URL_PATTERN = re.compile(r"https?://[^\s\)\]>\"]+")
 
+# Magnet URI extraction (excludes ) to avoid capturing markdown link parens)
+MAGNET_PATTERN = re.compile(r"magnet:\?xt=urn:btih:[^\s\"<>\)\]]+")
+# Extract btih hash for dedup (hex-40 or base32 formats)
+BTIH_HASH_RE = re.compile(r"xt=urn:btih:([a-fA-F0-9]{40}|[a-zA-Z2-7]{32})", re.IGNORECASE)
+
 
 @dataclass
 class ReplayLink:
     url: str
-    link_type: str  # "video", "embed", "external"
+    link_type: str  # "video", "embed", "external", "magnet"
     video_url: str | None = None  # resolved direct video URL for "video" type
     label: str = ""
 
@@ -198,7 +203,27 @@ def _classify_link(url: str) -> str:
 
 def _make_label(url: str) -> str:
     """Generate a human-readable label from a URL."""
-    from urllib.parse import urlparse
+    from urllib.parse import urlparse, parse_qs, unquote_plus
+
+    # Handle magnet URIs
+    if url.startswith("magnet:"):
+        # Try to extract display name from &dn= parameter
+        try:
+            # magnet URIs use ? as separator, parse_qs can handle the query part
+            query_start = url.find("?")
+            if query_start >= 0:
+                params = parse_qs(url[query_start + 1:])
+                dn = params.get("dn", [None])[0]
+                if dn:
+                    decoded = unquote_plus(dn)
+                    # Truncate long names
+                    if len(decoded) > 60:
+                        return decoded[:57] + "..."
+                    return decoded
+        except Exception:
+            pass
+        return "Magnet"
+
     parsed = urlparse(url)
     domain = parsed.netloc.lower().removeprefix("www.")
 
@@ -255,6 +280,27 @@ def _extract_links_from_post(post_data: dict) -> list[ReplayLink]:
                 label=_make_label(url),
             ))
 
+        # Extract magnet URIs from selftext
+        for match in MAGNET_PATTERN.finditer(selftext):
+            magnet_uri = match.group(0).rstrip(".,;:!?)")
+            # Dedup by btih hash, not full URI (same torrent may appear with different trackers)
+            btih_match = BTIH_HASH_RE.search(magnet_uri)
+            if btih_match:
+                btih_key = f"btih:{btih_match.group(1).lower()}"
+                if btih_key in seen_urls:
+                    continue
+                seen_urls.add(btih_key)
+            elif magnet_uri in seen_urls:
+                continue
+            else:
+                seen_urls.add(magnet_uri)
+
+            links.append(ReplayLink(
+                url=magnet_uri,
+                link_type="magnet",
+                label=_make_label(magnet_uri),
+            ))
+
     return links
 
 
@@ -308,12 +354,103 @@ async def _resolve_pixeldrain_url(url: str, client: httpx.AsyncClient) -> str | 
         return None
 
 
+async def _fetch_post_comments(permalink: str, client: httpx.AsyncClient) -> list[ReplayLink]:
+    """Extract links from Reddit post comments (top-level + 1 level of replies)."""
+    try:
+        url = f"https://www.reddit.com{permalink}.json?raw_json=1&limit=200"
+        resp = await client.get(url)
+        if resp.status_code == 429:
+            logger.warning("[replays] Reddit rate limited during comment fetch")
+            raise RateLimitError()
+        if resp.status_code != 200:
+            logger.debug("[replays] Comment fetch returned %d for %s", resp.status_code, permalink)
+            return []
+
+        data = resp.json()
+        # Reddit returns [post_listing, comments_listing]
+        if not isinstance(data, list) or len(data) < 2:
+            return []
+
+        comments_listing = data[1].get("data", {}).get("children", [])
+        links: list[ReplayLink] = []
+        seen_urls: set[str] = set()
+
+        def _extract_from_body(body: str) -> None:
+            """Extract URLs and magnet URIs from a comment body."""
+            # Extract URLs
+            for match in URL_PATTERN.finditer(body):
+                found_url = match.group(0).rstrip(".,;:!?)")
+                if found_url in seen_urls:
+                    continue
+                if "reddit.com" in found_url or "redd.it" in found_url:
+                    continue
+                seen_urls.add(found_url)
+                link_type = _classify_link(found_url)
+                links.append(ReplayLink(
+                    url=found_url,
+                    link_type=link_type,
+                    label=_make_label(found_url),
+                ))
+
+            # Extract magnet URIs
+            for match in MAGNET_PATTERN.finditer(body):
+                magnet_uri = match.group(0).rstrip(".,;:!?)")
+                btih_match = BTIH_HASH_RE.search(magnet_uri)
+                if btih_match:
+                    btih_key = f"btih:{btih_match.group(1).lower()}"
+                    if btih_key in seen_urls:
+                        continue
+                    seen_urls.add(btih_key)
+                elif magnet_uri in seen_urls:
+                    continue
+                else:
+                    seen_urls.add(magnet_uri)
+                links.append(ReplayLink(
+                    url=magnet_uri,
+                    link_type="magnet",
+                    label=_make_label(magnet_uri),
+                ))
+
+        # Walk top-level comments + 1 level of replies
+        for child in comments_listing:
+            if child.get("kind") != "t1":
+                continue
+            comment_data = child.get("data", {})
+            body = comment_data.get("body", "")
+            if body:
+                _extract_from_body(body)
+
+            # Check replies (1 level deep)
+            replies = comment_data.get("replies")
+            if isinstance(replies, dict):
+                reply_children = replies.get("data", {}).get("children", [])
+                for reply_child in reply_children:
+                    if reply_child.get("kind") != "t1":
+                        continue
+                    reply_body = reply_child.get("data", {}).get("body", "")
+                    if reply_body:
+                        _extract_from_body(reply_body)
+
+        return links
+    except RateLimitError:
+        raise
+    except Exception:
+        logger.debug("[replays] Failed to fetch comments for %s", permalink, exc_info=True)
+        return []
+
+
+class RateLimitError(Exception):
+    """Raised when Reddit returns 429."""
+    pass
+
+
 class ReplayService:
     """Scrapes r/MotorsportsReplays, caches results, and serves grouped replays."""
 
     def __init__(self) -> None:
         self._posts: list[ReplayPost] = []
         self._last_updated: str | None = None
+        self._fetched_comment_ids: set[str] = set()  # permalink IDs for comment cache
 
     async def scrape(self) -> None:
         """Fetch new posts from Reddit and update the cache."""
@@ -322,6 +459,7 @@ class ReplayService:
         cutoff_ts = cutoff.timestamp()
 
         posts: list[ReplayPost] = []
+        comment_enriched = 0
 
         try:
             async with httpx.AsyncClient(
@@ -411,13 +549,75 @@ class ReplayService:
                     if not after:
                         break
 
+                # Comment scanning: enrich posts that have few links
+                comment_enriched = 0
+                for post in posts:
+                    permalink = post.reddit_url.replace("https://www.reddit.com", "") if post.reddit_url else ""
+                    if not permalink:
+                        continue
+
+                    # Skip posts we've already fetched comments for
+                    if permalink in self._fetched_comment_ids:
+                        continue
+
+                    # Only fetch comments for posts with < 3 links (optimization)
+                    if len(post.links) >= 3:
+                        self._fetched_comment_ids.add(permalink)
+                        continue
+
+                    try:
+                        # Rate limit: 1 req/sec for comment fetches
+                        if comment_enriched > 0:
+                            await asyncio.sleep(1.0)
+
+                        comment_links = await _fetch_post_comments(permalink, client)
+                        self._fetched_comment_ids.add(permalink)
+
+                        if comment_links:
+                            # Build dedup set from existing post links
+                            existing_urls: set[str] = set()
+                            for link in post.links:
+                                existing_urls.add(link.url)
+                                # Also track btih hashes for magnet dedup
+                                if link.link_type == "magnet":
+                                    btih_match = BTIH_HASH_RE.search(link.url)
+                                    if btih_match:
+                                        existing_urls.add(f"btih:{btih_match.group(1).lower()}")
+
+                            # Merge new links, dedup against existing
+                            added = 0
+                            for clink in comment_links:
+                                # Check URL dedup
+                                if clink.url in existing_urls:
+                                    continue
+                                # Check btih dedup for magnets
+                                if clink.link_type == "magnet":
+                                    btih_match = BTIH_HASH_RE.search(clink.url)
+                                    if btih_match:
+                                        btih_key = f"btih:{btih_match.group(1).lower()}"
+                                        if btih_key in existing_urls:
+                                            continue
+                                        existing_urls.add(btih_key)
+                                existing_urls.add(clink.url)
+                                post.links.append(clink)
+                                added += 1
+
+                            if added > 0:
+                                logger.debug("[replays] Added %d links from comments for: %s", added, post.title)
+
+                        comment_enriched += 1
+
+                    except RateLimitError:
+                        logger.warning("[replays] Rate limited during comment scanning, stopping comment fetch")
+                        break
+
         except Exception:
             logger.exception("[replays] Failed to scrape Reddit")
             return
 
         self._posts = posts
         self._last_updated = datetime.now(timezone.utc).isoformat()
-        logger.info("[replays] Scraped %d F1 replay post(s)", len(posts))
+        logger.info("[replays] Scraped %d F1 replay post(s), enriched %d with comments", len(posts), comment_enriched)
 
     def get_replays_grouped(self, schedule_races: list[dict] | None = None) -> dict:
         """Return replay posts grouped by event, with sessions as sub-groups."""

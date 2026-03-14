@@ -296,7 +296,7 @@
 	{#if players.length > 0}
 		<div class="grid {layoutClass} gap-2 mb-6">
 			{#each players as player, i (player.id)}
-				<div class="bg-black rounded-lg overflow-hidden relative group" bind:this={player.containerEl} onmousemove={() => onPlayerMouseMove(i)} role="region" aria-label="Player {i + 1}">
+				<div class="hls-player-container bg-black rounded-lg overflow-hidden relative group" bind:this={player.containerEl} onmousemove={() => onPlayerMouseMove(i)} role="region" aria-label="Player {i + 1}">
 					<div class="absolute top-2 left-2 z-10 bg-black/60 rounded px-2 py-0.5 text-xs text-white">
 						{player.siteName}{#if player.quality} &middot; {player.quality}{/if}
 					</div>

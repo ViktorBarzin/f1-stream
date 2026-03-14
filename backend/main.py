@@ -1,8 +1,12 @@
 """F1 Streams - FastAPI backend with schedule, stream extraction, health checking, HLS proxy, and token refresh."""
 
+import asyncio
 import logging
 import os
+import re
+import time
 from contextlib import asynccontextmanager
+from urllib.parse import quote
 
 import httpx
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -33,6 +37,14 @@ token_refresh_manager = TokenRefreshManager(extraction_service)
 replay_service = ReplayService()
 scheduler = AsyncIOScheduler()
 
+# --- TorrServer config ---
+TORRSERVER_URL = os.environ.get("TORRSERVER_URL", "http://torrserver.tor-proxy.svc.cluster.local:8090")
+_TORRENT_HASH_RE = re.compile(r"^[a-fA-F0-9]{40}$")
+_active_torrents: dict[str, float] = {}  # hash → last_access_timestamp
+_torrent_file_names: dict[str, dict[int, str]] = {}  # hash → {file_index: basename}
+_torrents_lock = asyncio.Lock()
+_torrent_status_cache: tuple[bool, float] = (False, 0.0)  # (available, timestamp)
+
 
 # --- Pydantic models for request bodies ---
 
@@ -48,6 +60,24 @@ class DeactivateStreamRequest(BaseModel):
     """Request body for POST /streams/deactivate."""
 
     url: str
+
+
+class TorrentFilesRequest(BaseModel):
+    """Request body for POST /api/replays/torrent-files."""
+
+    magnet: str
+
+
+class TorrentStopRequest(BaseModel):
+    """Request body for POST /api/replays/torrent-stop."""
+
+    hash: str
+
+
+class TorrentHeartbeatRequest(BaseModel):
+    """Request body for POST /api/replays/torrent-heartbeat."""
+
+    hash: str
 
 
 # --- Scheduled callbacks ---
@@ -121,6 +151,95 @@ async def _scheduled_replay_scrape() -> None:
     await replay_service.scrape()
 
 
+async def _scheduled_torrent_idle_cleanup() -> None:
+    """Remove idle torrents not accessed in 4 hours."""
+    cutoff = time.time() - 4 * 3600  # 4 hours
+
+    # Collect stale hashes under lock
+    stale_hashes: list[str] = []
+    async with _torrents_lock:
+        for h, ts in _active_torrents.items():
+            if ts < cutoff:
+                stale_hashes.append(h)
+
+    if not stale_hashes:
+        return
+
+    # Drop them from TorrServer WITHOUT holding the lock
+    logger.info("[torrent] Cleaning up %d idle torrent(s)", len(stale_hashes))
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        for h in stale_hashes:
+            try:
+                await client.post(
+                    f"{TORRSERVER_URL}/torrents",
+                    json={"action": "drop", "hash": h},
+                )
+            except Exception:
+                logger.debug("[torrent] Failed to drop idle torrent %s", h, exc_info=True)
+
+    # Re-acquire lock and remove dropped hashes
+    async with _torrents_lock:
+        for h in stale_hashes:
+            _active_torrents.pop(h, None)
+            _torrent_file_names.pop(h, None)
+
+
+async def _scheduled_torrent_daily_cleanup() -> None:
+    """Remove all torrents older than 7 days from TorrServer."""
+    from datetime import datetime, timezone as tz, timedelta
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.post(
+                f"{TORRSERVER_URL}/torrents",
+                json={"action": "list"},
+            )
+            if resp.status_code != 200:
+                logger.warning("[torrent] Daily cleanup: TorrServer returned %d", resp.status_code)
+                return
+
+            torrents = resp.json()
+            if not isinstance(torrents, list):
+                return
+
+            cutoff = datetime.now(tz.utc) - timedelta(days=7)
+            dropped = 0
+            dropped_hashes: list[str] = []
+
+            for torrent in torrents:
+                ts = torrent.get("timestamp", 0)
+                try:
+                    if isinstance(ts, (int, float)):
+                        created = datetime.fromtimestamp(ts, tz=tz.utc)
+                    else:
+                        created = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+                except Exception:
+                    continue
+
+                if created < cutoff:
+                    h = torrent.get("hash", "")
+                    if h:
+                        try:
+                            await client.post(
+                                f"{TORRSERVER_URL}/torrents",
+                                json={"action": "drop", "hash": h},
+                            )
+                            dropped += 1
+                            dropped_hashes.append(h)
+                        except Exception:
+                            logger.debug("[torrent] Failed to drop old torrent %s", h, exc_info=True)
+
+            if dropped:
+                async with _torrents_lock:
+                    for h in dropped_hashes:
+                        _active_torrents.pop(h, None)
+                        _torrent_file_names.pop(h, None)
+                logger.info("[torrent] Daily cleanup: dropped %d old torrent(s)", dropped)
+
+    except Exception:
+        logger.debug("[torrent] Daily cleanup failed", exc_info=True)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Startup and shutdown lifecycle handler."""
@@ -172,9 +291,29 @@ async def lifespan(app: FastAPI):
         replace_existing=True,
     )
 
+    # Schedule torrent idle cleanup every 10 minutes
+    scheduler.add_job(
+        _scheduled_torrent_idle_cleanup,
+        trigger=IntervalTrigger(minutes=10),
+        id="torrent_idle_cleanup",
+        name="Clean up idle torrents from TorrServer",
+        replace_existing=True,
+        max_instances=1,
+        coalesce=True,
+    )
+
+    # Schedule torrent 7-day cleanup daily at 04:00 UTC
+    scheduler.add_job(
+        _scheduled_torrent_daily_cleanup,
+        trigger=CronTrigger(hour=4, minute=0, timezone="UTC"),
+        id="torrent_daily_cleanup",
+        name="Remove torrents older than 7 days from TorrServer",
+        replace_existing=True,
+    )
+
     scheduler.start()
     logger.info(
-        "APScheduler started - schedule refresh at 03:00 UTC, extraction every 30m, token refresh every 4m, replay scrape every 30m"
+        "APScheduler started - schedule refresh at 03:00 UTC, extraction every 30m, token refresh every 4m, replay scrape every 30m, torrent cleanup every 10m + daily"
     )
 
     yield
@@ -477,6 +616,229 @@ async def replay_download(
         await client.aclose()
         logger.exception("Replay download error for %s", decoded_url)
         return Response(content=f"Download error: {e}", status_code=502)
+
+
+# --- Torrent Streaming ---
+
+
+@app.get("/api/replays/torrent-status")
+async def torrent_status():
+    """Check if TorrServer is reachable. Result cached for 30s."""
+    global _torrent_status_cache
+    now = time.time()
+    cached_available, cached_ts = _torrent_status_cache
+    if now - cached_ts < 30:
+        return {"available": cached_available}
+
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            resp = await client.get(f"{TORRSERVER_URL}/echo")
+            available = resp.status_code == 200
+    except Exception:
+        available = False
+
+    _torrent_status_cache = (available, now)
+    return {"available": available}
+
+
+@app.post("/api/replays/torrent-files")
+async def torrent_files(body: TorrentFilesRequest):
+    """Add a magnet to TorrServer and return the file listing."""
+    magnet = body.magnet
+    if not magnet.startswith("magnet:?xt=urn:btih:"):
+        return Response(content="Invalid magnet URI", status_code=400)
+
+    try:
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            # Step 1: Add the magnet to TorrServer
+            add_resp = await client.post(
+                f"{TORRSERVER_URL}/torrents",
+                json={"action": "add", "link": magnet, "title": "", "save_to_db": False},
+            )
+            if add_resp.status_code != 200:
+                return Response(content=f"TorrServer add failed: {add_resp.status_code}", status_code=502)
+
+            torrent_data = add_resp.json()
+            torrent_hash = torrent_data.get("hash", "")
+            if not torrent_hash:
+                return Response(content="TorrServer returned no hash", status_code=502)
+
+            # Track in active torrents
+            async with _torrents_lock:
+                _active_torrents[torrent_hash] = time.time()
+
+            # Step 2: Poll for file_stats (metadata may take time to arrive)
+            file_stats = []
+            for _ in range(15):  # 15 * 2s = 30s max
+                get_resp = await client.post(
+                    f"{TORRSERVER_URL}/torrents",
+                    json={"action": "get", "hash": torrent_hash},
+                )
+                if get_resp.status_code == 200:
+                    data = get_resp.json()
+                    file_stats = data.get("file_stats") or []
+                    if file_stats:
+                        break
+                await asyncio.sleep(2.0)
+
+            if not file_stats:
+                return Response(content="Torrent metadata timeout - no files found after 30s", status_code=504)
+
+            files = [
+                {
+                    "name": f.get("path", f"file_{i}"),
+                    "length": f.get("length", 0),
+                    "index": f.get("id", i),
+                }
+                for i, f in enumerate(file_stats)
+            ]
+
+            file_name_map: dict[int, str] = {}
+            for f in files:
+                try:
+                    file_index = int(f["index"])
+                except (TypeError, ValueError):
+                    continue
+                file_path = str(f["name"]).replace("\\", "/")
+                file_name_map[file_index] = file_path.rsplit("/", 1)[-1] or f"file_{file_index}"
+
+            async with _torrents_lock:
+                _torrent_file_names[torrent_hash] = file_name_map
+
+            return {"hash": torrent_hash, "files": files}
+
+    except Exception as e:
+        logger.exception("[torrent] Failed to add magnet")
+        return Response(content=f"TorrServer error: {e}", status_code=502)
+
+
+@app.get("/api/replays/torrent-stream")
+async def torrent_stream(
+    request: Request,
+    hash: str = Query(..., description="Torrent info hash (hex-40)"),
+    index: int = Query(..., description="File index within the torrent", ge=0),
+):
+    """Stream a file from TorrServer."""
+    if not _TORRENT_HASH_RE.match(hash):
+        return Response(content="Invalid hash format", status_code=400)
+
+    # Guard: hash must be tracked
+    async with _torrents_lock:
+        if hash not in _active_torrents:
+            return Response(content="Unknown torrent hash", status_code=404)
+        _active_torrents[hash] = time.time()
+        file_name = _torrent_file_names.get(hash, {}).get(index)
+
+    if not file_name:
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                get_resp = await client.post(
+                    f"{TORRSERVER_URL}/torrents",
+                    json={"action": "get", "hash": hash},
+                )
+                if get_resp.status_code == 200:
+                    data = get_resp.json()
+                    file_stats = data.get("file_stats") or []
+                    file_name_map: dict[int, str] = {}
+                    for i, f in enumerate(file_stats):
+                        try:
+                            file_index = int(f.get("id", i))
+                        except (TypeError, ValueError):
+                            continue
+                        file_path = str(f.get("path", f"file_{i}")).replace("\\", "/")
+                        file_name_map[file_index] = file_path.rsplit("/", 1)[-1] or f"file_{file_index}"
+
+                    file_name = file_name_map.get(index)
+                    if file_name_map:
+                        async with _torrents_lock:
+                            _torrent_file_names[hash] = file_name_map
+        except Exception:
+            logger.debug("[torrent] Failed to resolve filename for hash=%s index=%d", hash, index, exc_info=True)
+
+    if not file_name:
+        return Response(content="Unknown torrent file index", status_code=404)
+
+    # Proxy the stream from TorrServer
+    stream_url = f"{TORRSERVER_URL}/stream/{quote(file_name)}?link={hash}&index={index}&play"
+    range_header = request.headers.get("range")
+    headers_to_send = {}
+    if range_header:
+        headers_to_send["Range"] = range_header
+
+    client = httpx.AsyncClient(timeout=httpx.Timeout(connect=120.0, read=120.0, write=30.0, pool=30.0), follow_redirects=True)
+    try:
+        resp = await client.send(
+            client.build_request("GET", stream_url, headers=headers_to_send),
+            stream=True,
+        )
+
+        response_headers = {
+            "Content-Type": resp.headers.get("Content-Type", "video/mp4"),
+            "Accept-Ranges": "bytes",
+        }
+        if "Content-Length" in resp.headers:
+            response_headers["Content-Length"] = resp.headers["Content-Length"]
+        if "Content-Range" in resp.headers:
+            response_headers["Content-Range"] = resp.headers["Content-Range"]
+
+        async def stream_torrent():
+            try:
+                async for chunk in resp.aiter_bytes(chunk_size=65536):
+                    yield chunk
+            finally:
+                await resp.aclose()
+                await client.aclose()
+
+        return StreamingResponse(
+            stream_torrent(),
+            status_code=resp.status_code,
+            headers=response_headers,
+        )
+
+    except Exception as e:
+        await client.aclose()
+        logger.exception("[torrent] Stream proxy error for hash=%s index=%d", hash, index)
+        return Response(content=f"Stream error: {e}", status_code=502)
+
+
+@app.post("/api/replays/torrent-stop")
+async def torrent_stop(body: TorrentStopRequest):
+    """Stop a torrent and remove it from TorrServer."""
+    h = body.hash
+    if not _TORRENT_HASH_RE.match(h):
+        return Response(content="Invalid hash format", status_code=400)
+
+    async with _torrents_lock:
+        if h not in _active_torrents:
+            return Response(content="Unknown torrent hash", status_code=404)
+        del _active_torrents[h]
+        _torrent_file_names.pop(h, None)
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            await client.post(
+                f"{TORRSERVER_URL}/torrents",
+                json={"action": "drop", "hash": h},
+            )
+    except Exception:
+        logger.debug("[torrent] Failed to drop torrent %s from TorrServer", h, exc_info=True)
+
+    return {"status": "stopped", "hash": h}
+
+
+@app.post("/api/replays/torrent-heartbeat")
+async def torrent_heartbeat(body: TorrentHeartbeatRequest):
+    """Keep a torrent stream alive by updating its last-access timestamp."""
+    h = body.hash
+    if not _TORRENT_HASH_RE.match(h):
+        return Response(content="Invalid hash format", status_code=400)
+
+    async with _torrents_lock:
+        if h not in _active_torrents:
+            return Response(content="Unknown torrent hash", status_code=404)
+        _active_torrents[h] = time.time()
+
+    return {"ok": True}
 
 
 # --- HLS Proxy ---

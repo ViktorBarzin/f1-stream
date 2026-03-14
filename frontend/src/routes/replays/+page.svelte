@@ -1,5 +1,9 @@
 <script>
-	import { fetchReplays, refreshReplays, getReplayVideoUrl, getReplayDownloadUrl } from '$lib/api.js';
+	import {
+		fetchReplays, refreshReplays, getReplayVideoUrl, getReplayDownloadUrl,
+		checkTorrserverStatus, fetchTorrentFiles, getTorrentStreamUrl,
+		stopTorrentStream, sendTorrentHeartbeat
+	} from '$lib/api.js';
 	import { onMount } from 'svelte';
 
 	let replaysData = $state(null);
@@ -9,8 +13,56 @@
 	let expandedEvents = $state(new Set());
 	let activeVideo = $state(null); // { eventIdx, sessionType, postIdx, linkIdx }
 
+	// Torrent streaming state
+	let torrserverAvailable = $state(false);
+	let activeTorrentHash = $state(null);
+	let torrentStreamLoading = $state(false); // loading magnet metadata
+	let torrentFiles = $state(null); // { hash, files: [...] }
+	let torrentFilePickerFor = $state(null); // key string identifying which magnet link opened the picker
+	let torrentPlayerKey = $state(null); // key string for active torrent player
+	let torrentPlayerUrl = $state(null); // stream URL for active torrent player
+	let torrentBuffering = $state(false); // buffering spinner overlay
+	let torrentError = $state(null); // error message for torrent player
+	let copiedMagnet = $state(null); // key string for "Copied!" feedback
+	let heartbeatInterval = null;
+	let bufferTimeoutId = null;
+	const TORRENT_CONNECT_TIMEOUT_MS = 120_000;
+
 	onMount(() => {
 		loadReplays();
+		// Check TorrServer availability
+		checkTorrserverStatus()
+			.then(data => { torrserverAvailable = data.available; })
+			.catch(() => {
+				// Retry once after 5s (handles cold-start)
+				setTimeout(() => {
+					checkTorrserverStatus()
+						.then(data => { torrserverAvailable = data.available; })
+						.catch(() => {});
+				}, 5000);
+			});
+
+		// beforeunload handler for torrent cleanup
+		const onBeforeUnload = () => {
+			if (activeTorrentHash) {
+				navigator.sendBeacon(
+					'/api/replays/torrent-stop',
+					new Blob([JSON.stringify({ hash: activeTorrentHash })], { type: 'application/json' })
+				);
+			}
+		};
+		window.addEventListener('beforeunload', onBeforeUnload);
+
+		return () => {
+			// Cleanup on SvelteKit navigation
+			window.removeEventListener('beforeunload', onBeforeUnload);
+			if (heartbeatInterval) clearInterval(heartbeatInterval);
+			if (bufferTimeoutId) clearTimeout(bufferTimeoutId);
+			// Stop active torrent on component destroy
+			if (activeTorrentHash) {
+				stopTorrentStream(activeTorrentHash);
+			}
+		};
 	});
 
 	async function loadReplays() {
@@ -101,6 +153,145 @@
 	const SESSION_ORDER = { 'Race': 0, 'Sprint': 1, 'Sprint Qualifying': 2, 'Qualifying': 3, 'Practice': 4, 'Pre-Race': 5, 'Full Event': 6, 'Other': 7 };
 	function sessionOrder(type) {
 		return SESSION_ORDER[type] ?? 99;
+	}
+
+	// --- Torrent streaming functions ---
+
+	function magnetKey(eventIdx, sessionType, postIdx, linkIdx) {
+		return `magnet-${eventIdx}-${sessionType}-${postIdx}-${linkIdx}`;
+	}
+
+	async function handleMagnetStream(eventIdx, sessionType, postIdx, linkIdx, magnetUri) {
+		const key = magnetKey(eventIdx, sessionType, postIdx, linkIdx);
+		if (torrentStreamLoading) return; // prevent double-click
+
+		torrentStreamLoading = true;
+		torrentError = null;
+		torrentFilePickerFor = key;
+
+		try {
+			const data = await fetchTorrentFiles(magnetUri);
+			// Store hash immediately for beforeunload cleanup
+			activeTorrentHash = data.hash;
+			torrentFiles = data;
+
+			// If single video file, skip picker and start streaming directly
+			const videoFiles = data.files.filter(f =>
+				/\.(mp4|mkv|ts|avi|webm)$/i.test(f.name)
+			);
+			if (videoFiles.length === 1) {
+				startTorrentPlayback(key, data.hash, videoFiles[0].index);
+			}
+			// Otherwise, the file picker will be shown in the template
+		} catch (e) {
+			torrentError = e.message || 'Failed to fetch torrent metadata';
+			torrentFilePickerFor = null;
+		} finally {
+			torrentStreamLoading = false;
+		}
+	}
+
+	function startTorrentPlayback(key, hash, fileIndex) {
+		torrentPlayerKey = key;
+		torrentPlayerUrl = getTorrentStreamUrl(hash, fileIndex);
+		torrentBuffering = true;
+		torrentError = null;
+		torrentFilePickerFor = null; // close picker
+
+		// Buffer timeout — give up after 120s with no progress
+		if (bufferTimeoutId) clearTimeout(bufferTimeoutId);
+		bufferTimeoutId = setTimeout(() => {
+			if (torrentBuffering) {
+				torrentBuffering = false;
+				torrentError = 'Could not connect to enough peers. Try again later.';
+			}
+		}, TORRENT_CONNECT_TIMEOUT_MS);
+
+		// Start heartbeat
+		if (heartbeatInterval) clearInterval(heartbeatInterval);
+		heartbeatInterval = setInterval(() => {
+			if (activeTorrentHash) {
+				sendTorrentHeartbeat(activeTorrentHash);
+			}
+		}, 5 * 60 * 1000); // every 5 min
+	}
+
+	function onTorrentCanPlayThrough() {
+		torrentBuffering = false;
+		if (bufferTimeoutId) clearTimeout(bufferTimeoutId);
+	}
+
+	function onTorrentProgress() {
+		// Data is arriving — reset timeout counter
+		if (bufferTimeoutId) clearTimeout(bufferTimeoutId);
+		bufferTimeoutId = setTimeout(() => {
+			if (torrentBuffering) {
+				torrentBuffering = false;
+				torrentError = 'Could not connect to enough peers. Try again later.';
+			}
+		}, TORRENT_CONNECT_TIMEOUT_MS);
+	}
+
+	function onTorrentError() {
+		torrentBuffering = false;
+		if (bufferTimeoutId) clearTimeout(bufferTimeoutId);
+		torrentError = 'Video playback error. The stream may not be available yet.';
+	}
+
+	async function closeTorrentPlayer() {
+		if (heartbeatInterval) { clearInterval(heartbeatInterval); heartbeatInterval = null; }
+		if (bufferTimeoutId) { clearTimeout(bufferTimeoutId); bufferTimeoutId = null; }
+		if (activeTorrentHash) {
+			await stopTorrentStream(activeTorrentHash);
+			activeTorrentHash = null;
+		}
+		torrentPlayerKey = null;
+		torrentPlayerUrl = null;
+		torrentBuffering = false;
+		torrentError = null;
+		torrentFiles = null;
+		torrentFilePickerFor = null;
+	}
+
+	function cancelFilePicker() {
+		torrentFilePickerFor = null;
+		torrentFiles = null;
+		// Don't clear activeTorrentHash here — let the cleanup handle it if needed
+		if (activeTorrentHash && !torrentPlayerKey) {
+			stopTorrentStream(activeTorrentHash);
+			activeTorrentHash = null;
+		}
+	}
+
+	async function copyMagnet(eventIdx, sessionType, postIdx, linkIdx, magnetUri) {
+		const key = magnetKey(eventIdx, sessionType, postIdx, linkIdx);
+		try {
+			await navigator.clipboard.writeText(magnetUri);
+			copiedMagnet = key;
+			setTimeout(() => { if (copiedMagnet === key) copiedMagnet = null; }, 2000);
+		} catch {
+			// Fallback for older browsers
+			copiedMagnet = null;
+		}
+	}
+
+	function formatBytes(bytes) {
+		if (bytes < 1024) return `${bytes} B`;
+		if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+		if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+		return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`;
+	}
+
+	function getLargestVideoIndex(files) {
+		let best = null;
+		let bestSize = -1;
+		for (const f of files) {
+			if (/\.(mp4|mkv|ts|avi|webm)$/i.test(f.name) && f.length > bestSize) {
+				best = f.index;
+				bestSize = f.length;
+			}
+		}
+		return best;
 	}
 </script>
 
@@ -238,6 +429,46 @@
 																<svg class="w-3 h-3" fill="currentColor" viewBox="0 0 24 24"><path d="M21 3H3c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h18c1.1 0 2-.9 2-2V5c0-1.1-.9-2-2-2zm0 16H3V5h18v14zM9 8l7 4-7 4V8z"/></svg>
 																{link.label}
 															</a>
+														{:else if link.link_type === 'magnet'}
+															<div class="flex items-center gap-1">
+																{#if torrserverAvailable}
+																	<button
+																		onclick={() => handleMagnetStream(eventIdx, sessionType, postIdx, linkIdx, link.url)}
+																		disabled={torrentStreamLoading}
+																		class="flex items-center gap-1 px-2.5 py-1 rounded text-xs font-medium bg-orange-600/20 text-orange-300 border border-orange-500/30 hover:bg-orange-600/30 transition-colors disabled:opacity-50"
+																	>
+																		{#if torrentStreamLoading && torrentFilePickerFor === magnetKey(eventIdx, sessionType, postIdx, linkIdx)}
+																			<svg class="w-3 h-3 animate-spin" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/></svg>
+																		{:else}
+																			<svg class="w-3 h-3" fill="currentColor" viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg>
+																		{/if}
+																		Stream
+																	</button>
+																{:else}
+																	<span
+																		class="flex items-center gap-1 px-2.5 py-1 rounded text-xs font-medium bg-orange-600/10 text-orange-400/50 border border-orange-500/20 cursor-not-allowed"
+																		title="TorrServer not configured"
+																	>
+																		<svg class="w-3 h-3" fill="currentColor" viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg>
+																		Stream
+																	</span>
+																{/if}
+																<button
+																	onclick={() => copyMagnet(eventIdx, sessionType, postIdx, linkIdx, link.url)}
+																	class="flex items-center gap-1 px-2 py-1 rounded text-xs font-medium bg-orange-600/20 text-orange-300 border border-orange-500/30 hover:bg-orange-600/30 transition-colors"
+																	title="Copy magnet link"
+																>
+																	{#if copiedMagnet === magnetKey(eventIdx, sessionType, postIdx, linkIdx)}
+																		✓ Copied
+																	{:else}
+																		<svg class="w-3 h-3" fill="currentColor" viewBox="0 0 24 24"><path d="M16 1H4c-1.1 0-2 .9-2 2v14h2V3h12V1zm3 4H8c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h11c1.1 0 2-.9 2-2V7c0-1.1-.9-2-2-2zm0 16H8V7h11v14z"/></svg>
+																		Copy
+																	{/if}
+																</button>
+																<span class="text-[10px] text-orange-400/70 ml-0.5 max-w-[120px] truncate" title={link.label}>
+																	{link.label}
+																</span>
+															</div>
 														{:else}
 															<a
 																href={link.url}
@@ -251,6 +482,66 @@
 														{/if}
 													{/each}
 												</div>
+
+												<!-- Torrent file picker -->
+												{#each post.links as link, linkIdx}
+													{#if link.link_type === 'magnet' && torrentFilePickerFor === magnetKey(eventIdx, sessionType, postIdx, linkIdx) && torrentFiles}
+														{@const defaultIdx = getLargestVideoIndex(torrentFiles.files)}
+														<div class="mt-3 bg-f1-bg border border-orange-500/30 rounded-lg p-3">
+															<div class="flex items-center justify-between mb-2">
+																<h4 class="text-sm font-medium text-orange-300">Select a file to stream</h4>
+																<button onclick={cancelFilePicker} class="text-xs text-f1-text-muted hover:text-white">✕ Cancel</button>
+															</div>
+															<div class="space-y-1 max-h-[200px] overflow-y-auto" role="listbox" aria-label="Torrent files">
+																{#each torrentFiles.files as file}
+																	<button
+																		onclick={() => startTorrentPlayback(magnetKey(eventIdx, sessionType, postIdx, linkIdx), torrentFiles.hash, file.index)}
+																		class="w-full flex items-center justify-between px-3 py-1.5 rounded text-xs hover:bg-f1-surface-hover transition-colors text-left {file.index === defaultIdx ? 'bg-orange-600/10 border border-orange-500/20' : ''}"
+																		role="option"
+																		aria-selected={file.index === defaultIdx}
+																	>
+																		<span class="truncate flex-1 text-f1-text {file.index === defaultIdx ? 'text-orange-300 font-medium' : ''}">{file.name}</span>
+																		<span class="shrink-0 ml-2 text-f1-text-muted">{formatBytes(file.length)}</span>
+																	</button>
+																{/each}
+															</div>
+														</div>
+													{/if}
+												{/each}
+
+												<!-- Torrent video player -->
+												{#each post.links as link, linkIdx}
+													{#if link.link_type === 'magnet' && torrentPlayerKey === magnetKey(eventIdx, sessionType, postIdx, linkIdx)}
+														<div class="mt-3 rounded-lg overflow-hidden bg-black relative">
+															{#if torrentBuffering}
+																<div class="absolute inset-0 flex flex-col items-center justify-center bg-black/80 z-10">
+																	<div class="w-8 h-8 border-2 border-orange-500 border-t-transparent rounded-full animate-spin"></div>
+																	<p class="text-sm text-orange-300 mt-3">Connecting to torrent swarm...</p>
+																</div>
+															{/if}
+															{#if torrentError}
+																<div class="absolute inset-0 flex flex-col items-center justify-center bg-black/80 z-10">
+																	<p class="text-sm text-red-400">{torrentError}</p>
+																	<button onclick={closeTorrentPlayer} class="mt-2 px-3 py-1 text-xs bg-f1-surface border border-f1-border rounded hover:bg-f1-surface-hover">Close</button>
+																</div>
+															{/if}
+															<video
+																src={torrentPlayerUrl}
+																controls
+																class="w-full max-h-[500px]"
+																playsinline
+																oncanplaythrough={onTorrentCanPlayThrough}
+																onprogress={onTorrentProgress}
+																onerror={onTorrentError}
+															>
+																<track kind="captions" />
+															</video>
+															<div class="flex justify-end p-1 bg-f1-surface">
+																<button onclick={closeTorrentPlayer} class="text-xs text-f1-text-muted hover:text-white px-2 py-0.5">✕ Close player</button>
+															</div>
+														</div>
+													{/if}
+												{/each}
 
 												<!-- Inline video player -->
 												{#each post.links as link, linkIdx}

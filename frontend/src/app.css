@@ -29,7 +29,7 @@ body {
 	border-radius: 3px;
 }
 
-/* HLS video player */
-video::-webkit-media-controls {
+/* Hide native controls only on the HLS custom player (scoped to avoid breaking replay video controls) */
+.hls-player-container video::-webkit-media-controls {
 	display: none !important;
 }
