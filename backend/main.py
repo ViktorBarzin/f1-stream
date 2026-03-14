@@ -209,6 +209,36 @@ async def _probe_torrent_media_info(hash_value: str, index: int) -> dict:
     return result
 
 
+async def _get_torrent_media_info_for_compatibility(hash_value: str, index: int) -> dict:
+    """Return media info, falling back to a conservative full-transcode plan when probing fails."""
+    try:
+        return await _probe_torrent_media_info(hash_value, index)
+    except (RuntimeError, TimeoutError) as e:
+        file_name = await _resolve_tracked_torrent_file_name(hash_value, index)
+        if not file_name:
+            raise
+
+        _, ext = os.path.splitext(file_name.lower())
+        logger.warning(
+            "[torrent] Media probe unavailable for hash=%s index=%d, using conservative compatibility fallback: %s",
+            hash_value, index, e,
+        )
+        return {
+            "file_name": file_name,
+            "extension": ext,
+            "streams": [],
+            "video_codecs": [],
+            "audio_codecs": [],
+            "direct_play_supported": False,
+            "transcode_recommended": True,
+            "reasons": [
+                f"media probe unavailable: {e}",
+                "using conservative browser compatibility transcode",
+            ],
+            "probe_failed": True,
+        }
+
+
 async def _drain_process_stderr(stream: asyncio.StreamReader | None, buffer: bytearray) -> None:
     """Continuously read stderr from a subprocess to avoid pipe backpressure."""
     if stream is None:
@@ -390,7 +420,7 @@ async def _ensure_hls_transcode_session(hash_value: str, index: int, media_info:
 
 async def _resolve_hls_output_file(hash_value: str, index: int, file_name: str) -> tuple[dict, Path]:
     """Resolve an HLS playlist or segment file for an active compatibility session."""
-    media_info = await _probe_torrent_media_info(hash_value, index)
+    media_info = await _get_torrent_media_info_for_compatibility(hash_value, index)
     if media_info["direct_play_supported"]:
         raise ValueError("Direct play is supported for this file")
 
@@ -1067,7 +1097,7 @@ async def torrent_media_info(
         _active_torrents[hash] = time.time()
 
     try:
-        info = await _probe_torrent_media_info(hash, index)
+        info = await _get_torrent_media_info_for_compatibility(hash, index)
         return info
     except ValueError as e:
         return Response(content=str(e), status_code=404)
@@ -1158,7 +1188,7 @@ async def torrent_stream_transcode(
         _active_torrents[hash] = time.time()
 
     try:
-        media_info = await _probe_torrent_media_info(hash, index)
+        media_info = await _get_torrent_media_info_for_compatibility(hash, index)
     except ValueError as e:
         return Response(content=str(e), status_code=404)
     except RuntimeError as e:
@@ -1272,7 +1302,7 @@ async def torrent_stream_transcode_hls(
         _active_torrents[hash] = time.time()
 
     try:
-        media_info = await _probe_torrent_media_info(hash, index)
+        media_info = await _get_torrent_media_info_for_compatibility(hash, index)
     except ValueError as e:
         return Response(content=str(e), status_code=404)
     except RuntimeError as e:
