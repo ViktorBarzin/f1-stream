@@ -315,6 +315,20 @@
 		if (!info?.reasons?.length) return '';
 		return info.reasons.join('; ');
 	}
+
+	function getPlaybackModeLabel() {
+		return torrentPlayerTranscoded ? 'Transcoded' : 'Direct Play';
+	}
+
+	function formatCodecList(codecs) {
+		if (!codecs?.length) return 'Unknown';
+		return codecs.join(', ').toUpperCase();
+	}
+
+	function formatContainerLabel(info) {
+		if (!info?.extension) return 'Unknown';
+		return info.extension.replace('.', '').toUpperCase();
+	}
 </script>
 
 <svelte:head>
@@ -558,6 +572,26 @@
 															>
 																<track kind="captions" />
 															</video>
+															<div class="px-3 py-2 bg-f1-surface border-t border-f1-border/60">
+																<div class="flex flex-wrap gap-1.5">
+																	<span class="px-2 py-0.5 rounded text-[10px] font-semibold uppercase tracking-wide border {torrentPlayerTranscoded
+																		? 'bg-amber-600/20 text-amber-200 border-amber-500/30'
+																		: 'bg-emerald-600/20 text-emerald-200 border-emerald-500/30'}">
+																		{getPlaybackModeLabel()}
+																	</span>
+																	{#if torrentPlayerInfo}
+																		<span class="px-2 py-0.5 rounded text-[10px] font-medium bg-f1-bg text-f1-text-muted border border-f1-border">
+																			Container: {formatContainerLabel(torrentPlayerInfo)}
+																		</span>
+																		<span class="px-2 py-0.5 rounded text-[10px] font-medium bg-f1-bg text-f1-text-muted border border-f1-border">
+																			Video: {formatCodecList(torrentPlayerInfo.video_codecs)}
+																		</span>
+																		<span class="px-2 py-0.5 rounded text-[10px] font-medium bg-f1-bg text-f1-text-muted border border-f1-border">
+																			Audio: {formatCodecList(torrentPlayerInfo.audio_codecs)}
+																		</span>
+																	{/if}
+																</div>
+															</div>
 															{#if torrentPlayerTranscoded}
 																<div class="px-3 py-2 text-xs bg-amber-950/80 text-amber-200 border-t border-amber-600/30">
 																	<div class="font-medium">Audio compatibility mode enabled</div>
@@ -589,6 +623,16 @@
 															>
 																<track kind="captions" />
 															</video>
+															<div class="px-3 py-2 bg-f1-surface border-t border-f1-border/60">
+																<div class="flex flex-wrap gap-1.5">
+																	<span class="px-2 py-0.5 rounded text-[10px] font-semibold uppercase tracking-wide bg-blue-600/20 text-blue-200 border border-blue-500/30">
+																		Direct File
+																	</span>
+																	<span class="px-2 py-0.5 rounded text-[10px] font-medium bg-f1-bg text-f1-text-muted border border-f1-border">
+																		Source: {link.label}
+																	</span>
+																</div>
+															</div>
 														</div>
 													{/if}
 												{/each}
