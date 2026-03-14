@@ -459,6 +459,41 @@
 		if (!info?.extension) return 'Unknown';
 		return info.extension.replace('.', '').toUpperCase();
 	}
+
+	function getLinkTypeBadge(link) {
+		switch (link.link_type) {
+			case 'video':
+				return {
+					label: 'Instant HTTP',
+					hint: 'Fastest option — plays directly in the browser.',
+					className: 'bg-emerald-600/15 text-emerald-200 border-emerald-500/30'
+				};
+			case 'embed':
+				return {
+					label: 'Web Player',
+					hint: 'HTTP site/player — usually faster than torrents, opens in a new tab.',
+					className: 'bg-violet-600/15 text-violet-200 border-violet-500/30'
+				};
+			case 'external':
+				return {
+					label: 'External Link',
+					hint: 'HTTP link to another site — may need extra clicks.',
+					className: 'bg-slate-600/20 text-slate-200 border-slate-500/30'
+				};
+			case 'magnet':
+				return {
+					label: 'Torrent',
+					hint: 'Slower startup — waits for metadata, peers, and browser compatibility checks.',
+					className: 'bg-amber-600/15 text-amber-200 border-amber-500/30'
+				};
+			default:
+				return {
+					label: 'Link',
+					hint: 'Replay source link.',
+					className: 'bg-slate-600/20 text-slate-200 border-slate-500/30'
+				};
+		}
+	}
 </script>
 
 <svelte:head>
@@ -568,8 +603,9 @@
 												<!-- Links -->
 												<div class="flex flex-wrap gap-2">
 													{#each post.links as link, linkIdx}
+														{@const linkTypeBadge = getLinkTypeBadge(link)}
 														{#if link.link_type === 'video'}
-															<div class="flex items-center gap-1">
+															<div class="flex items-center gap-1.5">
 																<button
 																	onclick={() => playVideo(eventIdx, sessionType, postIdx, linkIdx, link)}
 																	class="flex items-center gap-1 px-2.5 py-1 rounded text-xs font-medium bg-green-600/20 text-green-300 border border-green-500/30 hover:bg-green-600/30 transition-colors"
@@ -584,19 +620,29 @@
 																>
 																	<svg class="w-3 h-3" fill="currentColor" viewBox="0 0 24 24"><path d="M19 9h-4V3H9v6H5l7 7 7-7zM5 18v2h14v-2H5z"/></svg>
 																</a>
+																<span
+																	class="px-1.5 py-0.5 rounded border text-[10px] font-medium {linkTypeBadge.className}"
+																	title={linkTypeBadge.hint}
+																>
+																	{linkTypeBadge.label}
+																</span>
 															</div>
 														{:else if link.link_type === 'embed'}
 															<a
 																href={link.url}
 																target="_blank"
 																rel="noopener"
-																class="flex items-center gap-1 px-2.5 py-1 rounded text-xs font-medium bg-purple-600/20 text-purple-300 border border-purple-500/30 hover:bg-purple-600/30 transition-colors"
+																class="flex items-center gap-1.5 px-2.5 py-1 rounded text-xs font-medium bg-purple-600/20 text-purple-300 border border-purple-500/30 hover:bg-purple-600/30 transition-colors"
+																title={linkTypeBadge.hint}
 															>
 																<svg class="w-3 h-3" fill="currentColor" viewBox="0 0 24 24"><path d="M21 3H3c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h18c1.1 0 2-.9 2-2V5c0-1.1-.9-2-2-2zm0 16H3V5h18v14zM9 8l7 4-7 4V8z"/></svg>
 																{link.label}
+																<span class="px-1.5 py-0.5 rounded border text-[10px] font-medium {linkTypeBadge.className}">
+																	{linkTypeBadge.label}
+																</span>
 															</a>
 														{:else if link.link_type === 'magnet'}
-															<div class="flex items-center gap-1">
+															<div class="flex items-center gap-1.5">
 																{#if torrserverAvailable}
 																	<button
 																		onclick={() => handleMagnetStream(eventIdx, sessionType, postIdx, linkIdx, link.url)}
@@ -634,16 +680,26 @@
 																<span class="text-[10px] text-orange-400/70 ml-0.5 max-w-[120px] truncate" title={link.label}>
 																	{link.label}
 																</span>
+																<span
+																	class="px-1.5 py-0.5 rounded border text-[10px] font-medium {linkTypeBadge.className}"
+																	title={linkTypeBadge.hint}
+																>
+																	{linkTypeBadge.label}
+																</span>
 															</div>
 														{:else}
 															<a
 																href={link.url}
 																target="_blank"
 																rel="noopener"
-																class="flex items-center gap-1 px-2.5 py-1 rounded text-xs font-medium bg-gray-600/20 text-gray-300 border border-gray-500/30 hover:bg-gray-600/30 transition-colors"
+																class="flex items-center gap-1.5 px-2.5 py-1 rounded text-xs font-medium bg-gray-600/20 text-gray-300 border border-gray-500/30 hover:bg-gray-600/30 transition-colors"
+																title={linkTypeBadge.hint}
 															>
 																<svg class="w-3 h-3" fill="currentColor" viewBox="0 0 24 24"><path d="M19 19H5V5h7V3H5c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h14c1.1 0 2-.9 2-2v-7h-2v7zM14 3v2h3.59l-9.83 9.83 1.41 1.41L19 6.41V10h2V3h-7z"/></svg>
 																{link.label}
+																<span class="px-1.5 py-0.5 rounded border text-[10px] font-medium {linkTypeBadge.className}">
+																	{linkTypeBadge.label}
+																</span>
 															</a>
 														{/if}
 													{/each}
