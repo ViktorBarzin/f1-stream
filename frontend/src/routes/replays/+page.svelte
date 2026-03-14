@@ -1,10 +1,12 @@
 <script>
 	import {
 		fetchReplays, refreshReplays, getReplayVideoUrl, getReplayDownloadUrl,
-		checkTorrserverStatus, fetchTorrentFiles, getTorrentStreamUrl, fetchTorrentMediaInfo, getTorrentTranscodeStreamUrl,
+		checkTorrserverStatus, fetchTorrentFiles, getTorrentStreamUrl, fetchTorrentMediaInfo, fetchTorrentTranscodeHlsStream,
 		stopTorrentStream, sendTorrentHeartbeat
 	} from '$lib/api.js';
-	import { onMount } from 'svelte';
+	import { onMount, onDestroy, tick } from 'svelte';
+
+	let Hls = null;
 
 	let replaysData = $state(null);
 	let loading = $state(true);
@@ -22,6 +24,7 @@
 	let torrentPlayerKey = $state(null); // key string for active torrent player
 	let torrentPlayerUrl = $state(null); // stream URL for active torrent player
 	let torrentPlayerTranscoded = $state(false); // whether current player is using ffmpeg transcode
+	let torrentPlayerUsesHls = $state(false); // whether current player uses hls.js/native HLS
 	let torrentPlayerInfo = $state(null); // compatibility info for current torrent file
 	let torrentBuffering = $state(false); // buffering spinner overlay
 	let torrentStatusText = $state(null); // current status label for long-running torrent setup
@@ -30,9 +33,16 @@
 	let copiedMagnet = $state(null); // key string for "Copied!" feedback
 	let heartbeatInterval = null;
 	let bufferTimeoutId = null;
+	let torrentVideoEl = $state(null);
+	let torrentHls = null;
 	const TORRENT_CONNECT_TIMEOUT_MS = 120_000;
 
 	onMount(() => {
+		void (async () => {
+			const hlsModule = await import('hls.js');
+			Hls = hlsModule.default;
+		})();
+
 		loadReplays();
 		// Check TorrServer availability
 		checkTorrserverStatus()
@@ -60,13 +70,16 @@
 		return () => {
 			// Cleanup on SvelteKit navigation
 			window.removeEventListener('beforeunload', onBeforeUnload);
-			if (heartbeatInterval) clearInterval(heartbeatInterval);
-			if (bufferTimeoutId) clearTimeout(bufferTimeoutId);
-			// Stop active torrent on component destroy
-			if (activeTorrentHash) {
-				stopTorrentStream(activeTorrentHash);
-			}
 		};
+	});
+
+	onDestroy(() => {
+		if (heartbeatInterval) clearInterval(heartbeatInterval);
+		if (bufferTimeoutId) clearTimeout(bufferTimeoutId);
+		destroyTorrentPlaybackClient();
+		if (activeTorrentHash) {
+			stopTorrentStream(activeTorrentHash);
+		}
 	});
 
 	async function loadReplays() {
@@ -210,19 +223,36 @@
 
 		const useTranscode = !!mediaInfo?.transcode_recommended || /\.mkv$/i.test(torrentFiles?.files?.find(f => f.index === fileIndex)?.name || '');
 		torrentStatusText = useTranscode
-			? 'Starting compatibility mode (audio transcode)...'
+			? 'Starting compatibility mode (HLS + audio transcode)...'
 			: 'Starting direct playback...';
+
+		destroyTorrentPlaybackClient();
 
 		torrentPlayerKey = key;
 		torrentPlayerUrl = useTranscode
-			? getTorrentTranscodeStreamUrl(hash, fileIndex)
+			? null
 			: getTorrentStreamUrl(hash, fileIndex);
 		torrentPlayerTranscoded = useTranscode;
+		torrentPlayerUsesHls = useTranscode;
 		torrentPlayerInfo = mediaInfo;
 		torrentBuffering = true;
 		torrentError = null;
 		torrentTranscodeFailed = false;
 		torrentFilePickerFor = null; // close picker
+
+		if (useTranscode) {
+			try {
+				const hlsStream = await fetchTorrentTranscodeHlsStream(hash, fileIndex);
+				torrentPlayerUrl = hlsStream.playlist_url;
+				torrentStatusText = 'Preparing browser-compatible replay audio...';
+			} catch (e) {
+				torrentBuffering = false;
+				torrentStatusText = null;
+				torrentTranscodeFailed = true;
+				torrentError = e.message || 'Failed to start compatibility mode';
+				return;
+			}
+		}
 
 		// Buffer timeout — give up after 120s with no progress
 		if (bufferTimeoutId) clearTimeout(bufferTimeoutId);
@@ -240,9 +270,19 @@
 				sendTorrentHeartbeat(activeTorrentHash);
 			}
 		}, 5 * 60 * 1000); // every 5 min
+
+		if (useTranscode) {
+			await initTorrentHlsPlayback();
+		}
 	}
 
 	function onTorrentCanPlayThrough() {
+		torrentBuffering = false;
+		torrentStatusText = null;
+		if (bufferTimeoutId) clearTimeout(bufferTimeoutId);
+	}
+
+	function onTorrentPlaying() {
 		torrentBuffering = false;
 		torrentStatusText = null;
 		if (bufferTimeoutId) clearTimeout(bufferTimeoutId);
@@ -268,9 +308,80 @@
 		torrentError = 'Video playback error. The stream may not be available yet.';
 	}
 
+	function destroyTorrentPlaybackClient() {
+		if (torrentHls) {
+			torrentHls.destroy();
+			torrentHls = null;
+		}
+		if (torrentVideoEl) {
+			torrentVideoEl.removeAttribute('src');
+			torrentVideoEl.load?.();
+		}
+	}
+
+	async function initTorrentHlsPlayback() {
+		if (!torrentPlayerUrl) return;
+
+		await tick();
+		if (!torrentVideoEl) return;
+
+		if (!Hls) {
+			const hlsModule = await import('hls.js');
+			Hls = hlsModule.default;
+		}
+
+		destroyTorrentPlaybackClient();
+		torrentStatusText = 'Loading compatibility stream playlist...';
+
+		if (Hls?.isSupported()) {
+			const hls = new Hls({
+				enableWorker: true,
+				backBufferLength: 90,
+				maxBufferLength: 30
+			});
+			torrentHls = hls;
+			hls.loadSource(torrentPlayerUrl);
+			hls.attachMedia(torrentVideoEl);
+			hls.on(Hls.Events.MANIFEST_PARSED, () => {
+				torrentStatusText = 'Starting replay...';
+				torrentVideoEl.play().catch(() => {});
+			});
+			hls.on(Hls.Events.ERROR, (_event, data) => {
+				if (!data?.fatal) return;
+				if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
+					torrentStatusText = 'Reconnecting to compatibility stream...';
+					hls.startLoad();
+					return;
+				}
+				if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
+					torrentStatusText = 'Recovering replay audio...';
+					hls.recoverMediaError();
+					return;
+				}
+				onTorrentError();
+			});
+			return;
+		}
+
+		if (torrentVideoEl.canPlayType('application/vnd.apple.mpegurl')) {
+			torrentVideoEl.src = torrentPlayerUrl;
+			torrentVideoEl.addEventListener('loadedmetadata', () => {
+				torrentStatusText = 'Starting replay...';
+				torrentVideoEl.play().catch(() => {});
+			}, { once: true });
+			return;
+		}
+
+		torrentBuffering = false;
+		torrentStatusText = null;
+		torrentTranscodeFailed = true;
+		torrentError = 'This browser cannot play compatibility HLS streams.';
+	}
+
 	async function closeTorrentPlayer() {
 		if (heartbeatInterval) { clearInterval(heartbeatInterval); heartbeatInterval = null; }
 		if (bufferTimeoutId) { clearTimeout(bufferTimeoutId); bufferTimeoutId = null; }
+		destroyTorrentPlaybackClient();
 		if (activeTorrentHash) {
 			await stopTorrentStream(activeTorrentHash);
 			activeTorrentHash = null;
@@ -278,6 +389,7 @@
 		torrentPlayerKey = null;
 		torrentPlayerUrl = null;
 		torrentPlayerTranscoded = false;
+		torrentPlayerUsesHls = false;
 		torrentPlayerInfo = null;
 		torrentBuffering = false;
 		torrentStatusText = null;
@@ -335,7 +447,7 @@
 	}
 
 	function getPlaybackModeLabel() {
-		return torrentPlayerTranscoded ? 'Transcoded' : 'Direct Play';
+		return torrentPlayerTranscoded ? 'Compatibility HLS' : 'Direct Play';
 	}
 
 	function formatCodecList(codecs) {
@@ -588,13 +700,15 @@
 																</div>
 															{/if}
 															<video
-																src={torrentPlayerUrl}
+																src={torrentPlayerUsesHls ? undefined : torrentPlayerUrl}
 																controls
 																class="w-full max-h-[500px]"
 																playsinline
 																oncanplaythrough={onTorrentCanPlayThrough}
+																onplaying={onTorrentPlaying}
 																onprogress={onTorrentProgress}
 																onerror={onTorrentError}
+																bind:this={torrentVideoEl}
 															>
 																<track kind="captions" />
 															</video>
@@ -622,7 +736,7 @@
 																<div class="px-3 py-2 text-xs bg-amber-950/80 text-amber-200 border-t border-amber-600/30">
 																	<div class="font-medium">Audio compatibility mode enabled</div>
 																	<div class="mt-1 text-amber-200/80">
-																		This replay is being transcoded for browser-safe audio playback.
+																		This replay is being repackaged as HLS with AAC audio for more reliable browser playback.
 																		{#if torrentPlayerInfo}
 																			<span class="block mt-1">{getTranscodeReasonText(torrentPlayerInfo)}</span>
 																		{/if}

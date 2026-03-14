@@ -1,12 +1,16 @@
 """F1 Streams - FastAPI backend with schedule, stream extraction, health checking, HLS proxy, and token refresh."""
 
 import asyncio
+import json
 import logging
 import os
 import re
 import shlex
+import shutil
+import tempfile
 import time
 from contextlib import asynccontextmanager
+from pathlib import Path
 from urllib.parse import quote
 
 import httpx
@@ -16,7 +20,7 @@ from apscheduler.triggers.interval import IntervalTrigger
 from fastapi import FastAPI, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import HTMLResponse
+from fastapi.responses import FileResponse, HTMLResponse
 from pydantic import BaseModel
 from starlette.responses import Response, StreamingResponse
 
@@ -44,12 +48,15 @@ _TORRENT_HASH_RE = re.compile(r"^[a-fA-F0-9]{40}$")
 _active_torrents: dict[str, float] = {}  # hash → last_access_timestamp
 _torrent_file_names: dict[str, dict[int, str]] = {}  # hash → {file_index: basename}
 _torrent_media_info_cache: dict[str, dict[int, dict]] = {}  # hash → {file_index: media_info}
+_torrent_hls_sessions: dict[str, dict[int, dict]] = {}  # hash → {file_index: session_info}
 _torrents_lock = asyncio.Lock()
+_torrent_hls_session_guard = asyncio.Lock()
 _torrent_status_cache: tuple[bool, float] = (False, 0.0)  # (available, timestamp)
 _DIRECT_PLAY_FILE_EXTENSIONS = {".mp4", ".m4v", ".webm"}
 _DIRECT_PLAY_VIDEO_CODECS = {"h264", "hevc", "av1", "vp8", "vp9"}
 _DIRECT_PLAY_AUDIO_CODECS = {"aac", "mp3", "opus", "vorbis", "flac", "pcm_s16le", "pcm_s24le"}
 _MP4_COPY_VIDEO_CODECS = {"h264", "hevc", "av1"}
+_HLS_COPY_VIDEO_CODECS = {"h264"}
 
 
 # --- Pydantic models for request bodies ---
@@ -167,8 +174,6 @@ async def _probe_torrent_media_info(hash_value: str, index: int) -> dict:
         error_text = stderr.decode(errors="ignore").strip()
         raise RuntimeError(error_text or f"ffprobe failed with exit code {proc.returncode}")
 
-    import json
-
     probe_data = json.loads(stdout.decode() or "{}")
     streams = probe_data.get("streams", [])
     video_codecs = [s.get("codec_name", "") for s in streams if s.get("codec_type") == "video"]
@@ -202,6 +207,205 @@ async def _probe_torrent_media_info(hash_value: str, index: int) -> dict:
     async with _torrents_lock:
         _torrent_media_info_cache.setdefault(hash_value, {})[index] = result
     return result
+
+
+async def _drain_process_stderr(stream: asyncio.StreamReader | None, buffer: bytearray) -> None:
+    """Continuously read stderr from a subprocess to avoid pipe backpressure."""
+    if stream is None:
+        return
+
+    try:
+        while True:
+            chunk = await stream.read(4096)
+            if not chunk:
+                break
+            if len(buffer) < 32768:
+                remaining = 32768 - len(buffer)
+                buffer.extend(chunk[:remaining])
+    except Exception:
+        logger.debug("[torrent] Failed while draining ffmpeg stderr", exc_info=True)
+
+
+async def _cleanup_hls_session(session: dict | None) -> None:
+    """Stop an active HLS transcode session and remove temporary files."""
+    if not session:
+        return
+
+    proc = session.get("process")
+    if proc and proc.returncode is None:
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            pass
+        except Exception:
+            logger.debug("[torrent] Failed to stop ffmpeg HLS process", exc_info=True)
+
+        try:
+            await proc.wait()
+        except Exception:
+            logger.debug("[torrent] Failed waiting for ffmpeg HLS process to exit", exc_info=True)
+
+    stderr_task = session.get("stderr_task")
+    if stderr_task:
+        try:
+            await asyncio.wait_for(stderr_task, timeout=1.0)
+        except Exception:
+            stderr_task.cancel()
+
+    output_dir = session.get("output_dir")
+    if output_dir:
+        shutil.rmtree(output_dir, ignore_errors=True)
+
+
+async def _wait_for_hls_output(
+    file_path: Path,
+    session: dict,
+    *,
+    timeout: float = 20.0,
+) -> None:
+    """Wait until ffmpeg creates a non-empty HLS output file."""
+    deadline = time.time() + timeout
+    proc = session["process"]
+    stderr_buffer = session["stderr_buffer"]
+
+    while time.time() < deadline:
+        if file_path.exists():
+            try:
+                if file_path.stat().st_size > 0:
+                    return
+            except FileNotFoundError:
+                pass
+
+        if proc.returncode not in (None, 0):
+            stderr_text = stderr_buffer.decode(errors="ignore").strip()
+            raise RuntimeError(stderr_text or f"ffmpeg exited with code {proc.returncode}")
+
+        await asyncio.sleep(0.25)
+
+    stderr_text = stderr_buffer.decode(errors="ignore").strip()
+    raise RuntimeError(stderr_text or f"Timed out waiting for {file_path.name}")
+
+
+async def _ensure_hls_transcode_session(hash_value: str, index: int, media_info: dict) -> dict:
+    """Create or reuse an HLS transcode session for a torrent file."""
+    async with _torrent_hls_session_guard:
+        stale_session = None
+
+        async with _torrents_lock:
+            existing = _torrent_hls_sessions.get(hash_value, {}).get(index)
+            if existing:
+                playlist_path = Path(existing["playlist_path"])
+                if existing["process"].returncode is None and playlist_path.exists():
+                    existing["last_access"] = time.time()
+                    _active_torrents[hash_value] = time.time()
+                    return existing
+                stale_session = _torrent_hls_sessions.get(hash_value, {}).pop(index, None)
+                if not _torrent_hls_sessions.get(hash_value):
+                    _torrent_hls_sessions.pop(hash_value, None)
+
+        if stale_session:
+            await _cleanup_hls_session(stale_session)
+
+        stream_url = _build_torrserver_stream_url(hash_value, index, media_info["file_name"])
+        output_dir = tempfile.mkdtemp(prefix=f"f1-torrent-hls-{hash_value[:8]}-{index}-")
+        playlist_path = Path(output_dir) / "stream.m3u8"
+        segment_pattern = str(Path(output_dir) / "segment_%05d.ts")
+
+        video_codec = media_info["video_codecs"][0] if media_info["video_codecs"] else ""
+        copy_video = video_codec in _HLS_COPY_VIDEO_CODECS
+
+        ffmpeg_cmd = [
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel", "error",
+            "-nostdin",
+            "-i", stream_url,
+            "-map", "0:v:0?",
+            "-map", "0:a:0?",
+            "-sn",
+            "-dn",
+            "-c:v", "copy" if copy_video else "libx264",
+            "-preset", "veryfast",
+            "-c:a", "aac",
+            "-ac", "2",
+            "-b:a", "160k",
+            "-f", "hls",
+            "-hls_time", "6",
+            "-hls_playlist_type", "event",
+            "-hls_flags", "independent_segments+append_list",
+            "-hls_segment_filename", segment_pattern,
+            str(playlist_path),
+        ]
+
+        logger.info(
+            "[torrent] Starting HLS compatibility transcode hash=%s index=%d via ffmpeg: %s",
+            hash_value, index, " ".join(shlex.quote(part) for part in ffmpeg_cmd),
+        )
+
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *ffmpeg_cmd,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.PIPE,
+            )
+        except FileNotFoundError as e:
+            shutil.rmtree(output_dir, ignore_errors=True)
+            raise RuntimeError("ffmpeg is not installed in the backend image") from e
+        except Exception as e:
+            shutil.rmtree(output_dir, ignore_errors=True)
+            raise RuntimeError(f"Failed to start HLS transcoder: {e}") from e
+
+        stderr_buffer = bytearray()
+        stderr_task = asyncio.create_task(_drain_process_stderr(proc.stderr, stderr_buffer))
+        session = {
+            "hash": hash_value,
+            "index": index,
+            "output_dir": output_dir,
+            "playlist_path": str(playlist_path),
+            "process": proc,
+            "stderr_task": stderr_task,
+            "stderr_buffer": stderr_buffer,
+            "created_at": time.time(),
+            "last_access": time.time(),
+        }
+
+        async with _torrents_lock:
+            _torrent_hls_sessions.setdefault(hash_value, {})[index] = session
+            _active_torrents[hash_value] = time.time()
+
+        try:
+            await _wait_for_hls_output(playlist_path, session, timeout=20.0)
+        except Exception:
+            async with _torrents_lock:
+                current = _torrent_hls_sessions.get(hash_value, {}).get(index)
+                if current is session:
+                    _torrent_hls_sessions[hash_value].pop(index, None)
+                    if not _torrent_hls_sessions.get(hash_value):
+                        _torrent_hls_sessions.pop(hash_value, None)
+            await _cleanup_hls_session(session)
+            raise
+
+        return session
+
+
+async def _resolve_hls_output_file(hash_value: str, index: int, file_name: str) -> tuple[dict, Path]:
+    """Resolve an HLS playlist or segment file for an active compatibility session."""
+    media_info = await _probe_torrent_media_info(hash_value, index)
+    if media_info["direct_play_supported"]:
+        raise ValueError("Direct play is supported for this file")
+
+    session = await _ensure_hls_transcode_session(hash_value, index, media_info)
+    file_path = Path(session["output_dir"]) / file_name
+
+    await _wait_for_hls_output(file_path, session, timeout=20.0)
+
+    async with _torrents_lock:
+        active = _torrent_hls_sessions.get(hash_value, {}).get(index)
+        if active:
+            active["last_access"] = time.time()
+        _active_torrents[hash_value] = time.time()
+
+    return session, file_path
 
 
 # --- Scheduled callbacks ---
@@ -281,10 +485,13 @@ async def _scheduled_torrent_idle_cleanup() -> None:
 
     # Collect stale hashes under lock
     stale_hashes: list[str] = []
+    hls_sessions_to_cleanup: list[dict] = []
     async with _torrents_lock:
         for h, ts in _active_torrents.items():
             if ts < cutoff:
                 stale_hashes.append(h)
+        for h in stale_hashes:
+            hls_sessions_to_cleanup.extend(_torrent_hls_sessions.pop(h, {}).values())
 
     if not stale_hashes:
         return
@@ -308,6 +515,9 @@ async def _scheduled_torrent_idle_cleanup() -> None:
             _torrent_file_names.pop(h, None)
             _torrent_media_info_cache.pop(h, None)
 
+    for session in hls_sessions_to_cleanup:
+        await _cleanup_hls_session(session)
+
 
 async def _scheduled_torrent_daily_cleanup() -> None:
     """Remove all torrents older than 7 days from TorrServer."""
@@ -330,6 +540,7 @@ async def _scheduled_torrent_daily_cleanup() -> None:
             cutoff = datetime.now(tz.utc) - timedelta(days=7)
             dropped = 0
             dropped_hashes: list[str] = []
+            hls_sessions_to_cleanup: list[dict] = []
 
             for torrent in torrents:
                 ts = torrent.get("timestamp", 0)
@@ -360,6 +571,9 @@ async def _scheduled_torrent_daily_cleanup() -> None:
                         _active_torrents.pop(h, None)
                         _torrent_file_names.pop(h, None)
                         _torrent_media_info_cache.pop(h, None)
+                        hls_sessions_to_cleanup.extend(_torrent_hls_sessions.pop(h, {}).values())
+                for session in hls_sessions_to_cleanup:
+                    await _cleanup_hls_session(session)
                 logger.info("[torrent] Daily cleanup: dropped %d old torrent(s)", dropped)
 
     except Exception:
@@ -1043,6 +1257,112 @@ async def torrent_stream_transcode(
     return StreamingResponse(stream_transcoded(), status_code=200, headers=response_headers)
 
 
+@app.get("/api/replays/torrent-stream-transcode-hls")
+async def torrent_stream_transcode_hls(
+    hash: str = Query(..., description="Torrent info hash (hex-40)"),
+    index: int = Query(..., description="File index within the torrent", ge=0),
+):
+    """Start or reuse a browser-friendly HLS compatibility transcode session."""
+    if not _TORRENT_HASH_RE.match(hash):
+        return Response(content="Invalid hash format", status_code=400)
+
+    async with _torrents_lock:
+        if hash not in _active_torrents:
+            return Response(content="Unknown torrent hash", status_code=404)
+        _active_torrents[hash] = time.time()
+
+    try:
+        media_info = await _probe_torrent_media_info(hash, index)
+    except ValueError as e:
+        return Response(content=str(e), status_code=404)
+    except RuntimeError as e:
+        logger.warning("[torrent] Media probe failed for HLS transcode hash=%s index=%d: %s", hash, index, e)
+        return Response(content=f"Media probe failed: {e}", status_code=502)
+    except Exception:
+        logger.exception("[torrent] Unexpected media probe failure for HLS transcode hash=%s index=%d", hash, index)
+        return Response(content="Unexpected media probe error", status_code=500)
+
+    if media_info["direct_play_supported"]:
+        return Response(
+            content="Direct play is supported for this file; use /api/replays/torrent-stream instead",
+            status_code=409,
+        )
+
+    try:
+        await _resolve_hls_output_file(hash, index, "stream.m3u8")
+    except RuntimeError as e:
+        logger.warning("[torrent] HLS transcode startup failed for hash=%s index=%d: %s", hash, index, e)
+        return Response(content=f"HLS transcode failed: {e}", status_code=502)
+    except Exception:
+        logger.exception("[torrent] Unexpected HLS transcode failure for hash=%s index=%d", hash, index)
+        return Response(content="Unexpected HLS transcode error", status_code=500)
+
+    return {
+        "playlist_url": f"/api/replays/torrent-transcode-files/{hash}/{index}/stream.m3u8",
+        "segment_prefix": f"/api/replays/torrent-transcode-files/{hash}/{index}/",
+        "mode": "hls-audio-aac",
+    }
+
+
+@app.get("/api/replays/torrent-transcode-files/{hash}/{index}/{file_name:path}")
+async def torrent_transcode_files(
+    hash: str,
+    index: int,
+    file_name: str,
+):
+    """Serve playlist/segment files for an active replay compatibility HLS session."""
+    if not _TORRENT_HASH_RE.match(hash):
+        return Response(content="Invalid hash format", status_code=400)
+
+    if not file_name or file_name.startswith("/") or ".." in Path(file_name).parts:
+        return Response(content="Invalid file path", status_code=400)
+
+    async with _torrents_lock:
+        if hash not in _active_torrents:
+            return Response(content="Unknown torrent hash", status_code=404)
+        _active_torrents[hash] = time.time()
+
+    try:
+        session, file_path = await _resolve_hls_output_file(hash, index, file_name)
+    except ValueError as e:
+        return Response(content=str(e), status_code=409)
+    except RuntimeError as e:
+        logger.warning(
+            "[torrent] HLS file serve failed for hash=%s index=%d file=%s: %s",
+            hash, index, file_name, e,
+        )
+        return Response(content=f"HLS file unavailable: {e}", status_code=502)
+    except FileNotFoundError:
+        return Response(content="Transcoded file not found", status_code=404)
+    except Exception:
+        logger.exception(
+            "[torrent] Unexpected HLS file serve failure for hash=%s index=%d file=%s",
+            hash, index, file_name,
+        )
+        return Response(content="Unexpected HLS file serve error", status_code=500)
+
+    if not file_path.exists():
+        return Response(content="Transcoded file not found", status_code=404)
+
+    async with _torrents_lock:
+        active = _torrent_hls_sessions.get(hash, {}).get(index)
+        if active:
+            active["last_access"] = time.time()
+        _active_torrents[hash] = time.time()
+
+    media_type = "application/vnd.apple.mpegurl" if file_path.suffix == ".m3u8" else "video/mp2t"
+    headers = {
+        "Cache-Control": "no-store",
+        "X-Transcode": "audio-aac-hls",
+    }
+
+    if file_path.suffix == ".m3u8":
+        # Ensure file exists before responding so the first manifest load does not race.
+        await _wait_for_hls_output(Path(session["playlist_path"]), session, timeout=5.0)
+
+    return FileResponse(file_path, media_type=media_type, headers=headers)
+
+
 @app.post("/api/replays/torrent-stop")
 async def torrent_stop(body: TorrentStopRequest):
     """Stop a torrent and remove it from TorrServer."""
@@ -1050,12 +1370,14 @@ async def torrent_stop(body: TorrentStopRequest):
     if not _TORRENT_HASH_RE.match(h):
         return Response(content="Invalid hash format", status_code=400)
 
+    sessions_to_cleanup: list[dict] = []
     async with _torrents_lock:
         if h not in _active_torrents:
             return Response(content="Unknown torrent hash", status_code=404)
         del _active_torrents[h]
         _torrent_file_names.pop(h, None)
         _torrent_media_info_cache.pop(h, None)
+        sessions_to_cleanup.extend(_torrent_hls_sessions.pop(h, {}).values())
 
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
@@ -1065,6 +1387,9 @@ async def torrent_stop(body: TorrentStopRequest):
             )
     except Exception:
         logger.debug("[torrent] Failed to drop torrent %s from TorrServer", h, exc_info=True)
+
+    for session in sessions_to_cleanup:
+        await _cleanup_hls_session(session)
 
     return {"status": "stopped", "hash": h}
 

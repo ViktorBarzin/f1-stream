@@ -192,6 +192,21 @@ export function getTorrentTranscodeStreamUrl(hash, fileIndex) {
 }
 
 /**
+ * Start or reuse an HLS compatibility stream for a torrent replay.
+ * @param {string} hash - The torrent info hash
+ * @param {number} fileIndex - The file index within the torrent
+ * @returns {Promise<{playlist_url: string, segment_prefix: string, mode: string}>}
+ */
+export async function fetchTorrentTranscodeHlsStream(hash, fileIndex) {
+	const res = await fetch(`${API_BASE}/api/replays/torrent-stream-transcode-hls?hash=${encodeURIComponent(hash)}&index=${fileIndex}`);
+	if (!res.ok) {
+		const text = await res.text().catch(() => '');
+		throw new Error(`Torrent HLS transcode failed: ${res.status} ${text}`);
+	}
+	return res.json();
+}
+
+/**
  * Stop a torrent stream and clean up resources.
  * @param {string} hash - The torrent info hash
  */
