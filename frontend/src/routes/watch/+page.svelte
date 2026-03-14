@@ -188,6 +188,26 @@
 
 	function isStreamActive(url) { return players.some(p => p.originalUrl === url); }
 
+	function applyVideoState(player) {
+		if (!player?.videoEl) return;
+		player.videoEl.defaultMuted = !!player.isMuted;
+		player.videoEl.muted = !!player.isMuted;
+		player.videoEl.volume = typeof player.volume === 'number' ? player.volume : 1;
+	}
+
+	function selectDefaultAudioTrack(hlsInstance) {
+		const tracks = hlsInstance?.audioTracks || [];
+		if (!tracks.length) return;
+
+		const preferredIndex = tracks.findIndex(track => track.default) >= 0
+			? tracks.findIndex(track => track.default)
+			: 0;
+
+		if (hlsInstance.audioTrack !== preferredIndex) {
+			hlsInstance.audioTrack = preferredIndex;
+		}
+	}
+
 	function playStream(stream) {
 		const streamUrl = stream.stream_type === 'embed' ? stream.embed_url : stream.url;
 		if (isStreamActive(streamUrl)) return;
@@ -221,11 +241,17 @@
 	function initPlayer(index) {
 		const player = players[index];
 		if (!player || !player.videoEl) return;
+		applyVideoState(player);
 		if (Hls.isSupported()) {
 			const hlsInstance = new Hls({ enableWorker: true, lowLatencyMode: true, backBufferLength: 90 });
 			hlsInstance.loadSource(player.proxyUrl);
 			hlsInstance.attachMedia(player.videoEl);
+			hlsInstance.on(Hls.Events.AUDIO_TRACKS_UPDATED, () => {
+				selectDefaultAudioTrack(hlsInstance);
+			});
 			hlsInstance.on(Hls.Events.MANIFEST_PARSED, () => {
+				selectDefaultAudioTrack(hlsInstance);
+				applyVideoState(player);
 				player.videoEl.play().catch(() => {});
 				players[index] = { ...player, isPlaying: true, hls: hlsInstance };
 			});
@@ -239,7 +265,11 @@
 			player.hls = hlsInstance;
 		} else if (player.videoEl.canPlayType('application/vnd.apple.mpegurl')) {
 			player.videoEl.src = player.proxyUrl;
-			player.videoEl.addEventListener('loadedmetadata', () => { player.videoEl.play().catch(() => {}); players[index] = { ...player, isPlaying: true }; });
+			player.videoEl.addEventListener('loadedmetadata', () => {
+				applyVideoState(player);
+				player.videoEl.play().catch(() => {});
+				players[index] = { ...player, isPlaying: true };
+			});
 		}
 	}
 
