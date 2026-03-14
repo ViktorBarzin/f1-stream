@@ -24,7 +24,9 @@
 	let torrentPlayerTranscoded = $state(false); // whether current player is using ffmpeg transcode
 	let torrentPlayerInfo = $state(null); // compatibility info for current torrent file
 	let torrentBuffering = $state(false); // buffering spinner overlay
+	let torrentStatusText = $state(null); // current status label for long-running torrent setup
 	let torrentError = $state(null); // error message for torrent player
+	let torrentTranscodeFailed = $state(false); // whether compatibility mode failed
 	let copiedMagnet = $state(null); // key string for "Copied!" feedback
 	let heartbeatInterval = null;
 	let bufferTimeoutId = null;
@@ -169,6 +171,7 @@
 
 		torrentStreamLoading = true;
 		torrentError = null;
+		torrentStatusText = 'Fetching torrent metadata...';
 		torrentFilePickerFor = key;
 
 		try {
@@ -182,18 +185,22 @@
 				/\.(mp4|mkv|ts|avi|webm)$/i.test(f.name)
 			);
 			if (videoFiles.length === 1) {
-				startTorrentPlayback(key, data.hash, videoFiles[0].index);
+				await startTorrentPlayback(key, data.hash, videoFiles[0].index);
 			}
 			// Otherwise, the file picker will be shown in the template
 		} catch (e) {
 			torrentError = e.message || 'Failed to fetch torrent metadata';
 			torrentFilePickerFor = null;
 		} finally {
+			if (!torrentPlayerKey) {
+				torrentStatusText = null;
+			}
 			torrentStreamLoading = false;
 		}
 	}
 
 	async function startTorrentPlayback(key, hash, fileIndex) {
+		torrentStatusText = 'Checking browser playback compatibility...';
 		let mediaInfo = null;
 		try {
 			mediaInfo = await fetchTorrentMediaInfo(hash, fileIndex);
@@ -201,7 +208,10 @@
 			console.warn('Failed to fetch torrent media info', e);
 		}
 
-		const useTranscode = !!mediaInfo?.transcode_recommended;
+		const useTranscode = !!mediaInfo?.transcode_recommended || /\.mkv$/i.test(torrentFiles?.files?.find(f => f.index === fileIndex)?.name || '');
+		torrentStatusText = useTranscode
+			? 'Starting compatibility mode (audio transcode)...'
+			: 'Starting direct playback...';
 
 		torrentPlayerKey = key;
 		torrentPlayerUrl = useTranscode
@@ -211,6 +221,7 @@
 		torrentPlayerInfo = mediaInfo;
 		torrentBuffering = true;
 		torrentError = null;
+		torrentTranscodeFailed = false;
 		torrentFilePickerFor = null; // close picker
 
 		// Buffer timeout — give up after 120s with no progress
@@ -233,6 +244,7 @@
 
 	function onTorrentCanPlayThrough() {
 		torrentBuffering = false;
+		torrentStatusText = null;
 		if (bufferTimeoutId) clearTimeout(bufferTimeoutId);
 	}
 
@@ -242,6 +254,7 @@
 		bufferTimeoutId = setTimeout(() => {
 			if (torrentBuffering) {
 				torrentBuffering = false;
+				torrentStatusText = null;
 				torrentError = 'Could not connect to enough peers. Try again later.';
 			}
 		}, TORRENT_CONNECT_TIMEOUT_MS);
@@ -249,7 +262,9 @@
 
 	function onTorrentError() {
 		torrentBuffering = false;
+		torrentStatusText = null;
 		if (bufferTimeoutId) clearTimeout(bufferTimeoutId);
+		torrentTranscodeFailed = torrentPlayerTranscoded;
 		torrentError = 'Video playback error. The stream may not be available yet.';
 	}
 
@@ -265,7 +280,9 @@
 		torrentPlayerTranscoded = false;
 		torrentPlayerInfo = null;
 		torrentBuffering = false;
+		torrentStatusText = null;
 		torrentError = null;
+		torrentTranscodeFailed = false;
 		torrentFiles = null;
 		torrentFilePickerFor = null;
 	}
@@ -278,6 +295,7 @@
 			stopTorrentStream(activeTorrentHash);
 			activeTorrentHash = null;
 		}
+		torrentStatusText = null;
 	}
 
 	async function copyMagnet(eventIdx, sessionType, postIdx, linkIdx, magnetUri) {
@@ -528,6 +546,9 @@
 																<h4 class="text-sm font-medium text-orange-300">Select a file to stream</h4>
 																<button onclick={cancelFilePicker} class="text-xs text-f1-text-muted hover:text-white">✕ Cancel</button>
 															</div>
+															{#if torrentStatusText}
+																<div class="mb-2 text-xs text-orange-200/80">{torrentStatusText}</div>
+															{/if}
 															<div class="space-y-1 max-h-[200px] overflow-y-auto" role="listbox" aria-label="Torrent files">
 																{#each torrentFiles.files as file}
 																	<button
@@ -552,12 +573,17 @@
 															{#if torrentBuffering}
 																<div class="absolute inset-0 flex flex-col items-center justify-center bg-black/80 z-10">
 																	<div class="w-8 h-8 border-2 border-orange-500 border-t-transparent rounded-full animate-spin"></div>
-																	<p class="text-sm text-orange-300 mt-3">Connecting to torrent swarm...</p>
+																	<p class="text-sm text-orange-300 mt-3">{torrentStatusText || 'Connecting to torrent swarm...'}</p>
 																</div>
 															{/if}
 															{#if torrentError}
 																<div class="absolute inset-0 flex flex-col items-center justify-center bg-black/80 z-10">
 																	<p class="text-sm text-red-400">{torrentError}</p>
+																	{#if torrentTranscodeFailed}
+																		<p class="mt-2 max-w-md text-center text-xs text-red-300/80">
+																			Compatibility mode also failed. Try the download button or open the magnet in VLC / IINA for full codec support.
+																		</p>
+																	{/if}
 																	<button onclick={closeTorrentPlayer} class="mt-2 px-3 py-1 text-xs bg-f1-surface border border-f1-border rounded hover:bg-f1-surface-hover">Close</button>
 																</div>
 															{/if}

@@ -43,6 +43,7 @@ TORRSERVER_URL = os.environ.get("TORRSERVER_URL", "http://torrserver.tor-proxy.s
 _TORRENT_HASH_RE = re.compile(r"^[a-fA-F0-9]{40}$")
 _active_torrents: dict[str, float] = {}  # hash → last_access_timestamp
 _torrent_file_names: dict[str, dict[int, str]] = {}  # hash → {file_index: basename}
+_torrent_media_info_cache: dict[str, dict[int, dict]] = {}  # hash → {file_index: media_info}
 _torrents_lock = asyncio.Lock()
 _torrent_status_cache: tuple[bool, float] = (False, 0.0)  # (available, timestamp)
 _DIRECT_PLAY_FILE_EXTENSIONS = {".mp4", ".m4v", ".webm"}
@@ -130,6 +131,11 @@ def _build_torrserver_stream_url(hash_value: str, index: int, file_name: str) ->
 
 async def _probe_torrent_media_info(hash_value: str, index: int) -> dict:
     """Inspect a torrent file and determine whether browsers can direct-play it."""
+    async with _torrents_lock:
+        cached = _torrent_media_info_cache.get(hash_value, {}).get(index)
+    if cached:
+        return cached
+
     file_name = await _resolve_tracked_torrent_file_name(hash_value, index)
     if not file_name:
         raise ValueError("Unknown torrent file index")
@@ -151,7 +157,7 @@ async def _probe_torrent_media_info(hash_value: str, index: int) -> dict:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30.0)
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=8.0)
     except asyncio.TimeoutError as e:
         raise RuntimeError("ffprobe timed out") from e
     except FileNotFoundError as e:
@@ -183,7 +189,7 @@ async def _probe_torrent_media_info(hash_value: str, index: int) -> dict:
         direct_play_supported = False
         reasons.append(f"unsupported audio codec(s): {', '.join(audio_codecs)}")
 
-    return {
+    result = {
         "file_name": file_name,
         "extension": ext,
         "streams": streams,
@@ -193,6 +199,9 @@ async def _probe_torrent_media_info(hash_value: str, index: int) -> dict:
         "transcode_recommended": not direct_play_supported,
         "reasons": reasons,
     }
+    async with _torrents_lock:
+        _torrent_media_info_cache.setdefault(hash_value, {})[index] = result
+    return result
 
 
 # --- Scheduled callbacks ---
@@ -297,6 +306,7 @@ async def _scheduled_torrent_idle_cleanup() -> None:
         for h in stale_hashes:
             _active_torrents.pop(h, None)
             _torrent_file_names.pop(h, None)
+            _torrent_media_info_cache.pop(h, None)
 
 
 async def _scheduled_torrent_daily_cleanup() -> None:
@@ -349,6 +359,7 @@ async def _scheduled_torrent_daily_cleanup() -> None:
                     for h in dropped_hashes:
                         _active_torrents.pop(h, None)
                         _torrent_file_names.pop(h, None)
+                        _torrent_media_info_cache.pop(h, None)
                 logger.info("[torrent] Daily cleanup: dropped %d old torrent(s)", dropped)
 
     except Exception:
@@ -1044,6 +1055,7 @@ async def torrent_stop(body: TorrentStopRequest):
             return Response(content="Unknown torrent hash", status_code=404)
         del _active_torrents[h]
         _torrent_file_names.pop(h, None)
+        _torrent_media_info_cache.pop(h, None)
 
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
