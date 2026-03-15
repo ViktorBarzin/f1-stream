@@ -1,0 +1,18 @@
+when:
+  - event: manual
+
+steps:
+  - name: deploy
+    image: bitnami/kubectl:1.32
+    commands:
+      - kubectl set image deployment/f1-stream f1-stream=${IMAGE_NAME}:${IMAGE_TAG} -n f1-stream
+      - kubectl rollout status deployment/f1-stream -n f1-stream --timeout=300s
+
+  - name: notify
+    image: woodpeckerci/plugin-slack
+    settings:
+      webhook:
+        from_secret: slack-webhook-url
+      channel: general
+    when:
+      - status: [success, failure]
